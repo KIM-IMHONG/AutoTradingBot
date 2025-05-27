@@ -467,11 +467,12 @@ class TradingBot:
             # 시장 변동성 계산
             volatility = self.calculate_market_volatility()
             
-            # 동적 포지션 사이즈 계산
+            # 동적 포지션 사이즈 계산 (BTC 단위로 변환)
             dynamic_position_size = self.calculate_dynamic_position_size(score or 0.5, volatility, self.account_balance)
+            dynamic_position_size = dynamic_position_size / price  # USD를 BTC로 변환
             
             # 신호/점수/ADX 로그
-            log_msg = f"Signal: {signal}, Score: {score}, ADX: {adx}, Volatility: {volatility:.4f}, Position Size: {dynamic_position_size:.2f}, Reason: {reason}"
+            log_msg = f"Signal: {signal}, Score: {score}, ADX: {adx}, Volatility: {volatility:.4f}, Position Size: {dynamic_position_size:.3f} BTC, Reason: {reason}"
             logger.info(log_msg)
             await self.telegram.send_message(f"[TRADE] {log_msg}")
 
@@ -510,7 +511,7 @@ class TradingBot:
                 self.signal_confirmation_count = 0
                 self.total_trades += 1
                 await self.telegram.send_trade_signal(
-                    'BUY', TRADING_SYMBOL, price, f'Signal: {reason}\nSL: {stop_loss:.2f}, TP: {take_profit:.2f}\nSize: {dynamic_position_size:.2f}'
+                    'BUY', TRADING_SYMBOL, price, f'Signal: {reason}\nSL: {stop_loss:.2f}, TP: {take_profit:.2f}\nSize: {dynamic_position_size:.3f} BTC'
                 )
             elif signal == -1 and (not self.current_position or reverse):  # Sell signal
                 stop_loss, take_profit = self.technical_analyzer.calculate_stop_loss_take_profit(
@@ -528,7 +529,7 @@ class TradingBot:
                 self.signal_confirmation_count = 0
                 self.total_trades += 1
                 await self.telegram.send_trade_signal(
-                    'SELL', TRADING_SYMBOL, price, f'Signal: {reason}\nSL: {stop_loss:.2f}, TP: {take_profit:.2f}\nSize: {dynamic_position_size:.2f}'
+                    'SELL', TRADING_SYMBOL, price, f'Signal: {reason}\nSL: {stop_loss:.2f}, TP: {take_profit:.2f}\nSize: {dynamic_position_size:.3f} BTC'
                 )
 
             await self.update_position()
@@ -544,10 +545,10 @@ class TradingBot:
                 return min(50, LEVERAGE * 1.5)  # Increase leverage in strong trends, max 50x
             elif adx < 20 or score < 0.5:
                 return max(5, LEVERAGE * 0.5)  # Decrease leverage in weak trends
-            return LEVERAGE
+            return min(50, LEVERAGE)  # Default leverage, max 50x
         except Exception as e:
             logger.error(f"Error in calculate_dynamic_leverage: {e}")
-            return LEVERAGE  # Fallback to default leverage
+            return min(50, LEVERAGE)  # Fallback to default leverage, max 50x
 
     def calculate_stop_loss_take_profit(self, df, entry_price, side, leverage=LEVERAGE, lookback=10, min_pct=0.3):
         """

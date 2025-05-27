@@ -127,6 +127,63 @@ class BinanceClient:
             self.logger.error(f"Unexpected error in kline stream: {e}")
             raise
 
+    async def place_order(self, side, quantity, order_type='MARKET', reduce_only=False):
+        """Place an order with proper quantity precision"""
+        try:
+            # 수량 정밀도 조정 (BTC의 경우 3자리까지)
+            quantity = round(quantity, 3)
+            
+            # 최소 주문 수량 확인 (BTC의 경우 0.001)
+            if quantity < 0.001:
+                quantity = 0.001
+                
+            params = {
+                'symbol': TRADING_SYMBOL,
+                'side': side,
+                'type': order_type,
+                'quantity': quantity,
+                'reduceOnly': reduce_only
+            }
+            
+            order = await self.client.futures_create_order(**params)
+            self.logger.info(f"Order placed: {side} {quantity} {TRADING_SYMBOL}")
+            return order
+        except Exception as e:
+            self.logger.error(f"Failed to place order: {e}")
+            return None
+
+    async def get_position(self):
+        """Get current position information"""
+        try:
+            positions = await self.client.futures_position_information(symbol=self.symbol)
+            return positions[0] if positions else None
+        except BinanceAPIException as e:
+            self.logger.error(f"Failed to get position: {e}")
+            raise
+
+    async def close(self):
+        """Close the Binance client connection"""
+        if self.client:
+            await self.client.close_connection()
+            self.logger.info("Binance client connection closed")
+
+    async def set_leverage(self, leverage):
+        """Set leverage for the trading pair"""
+        try:
+            # 레버리지 값을 정수로 변환하고 범위 제한
+            leverage = int(min(max(1, leverage), 50))  # 최대 레버리지는 50x
+            
+            params = {
+                'symbol': TRADING_SYMBOL,
+                'leverage': leverage
+            }
+            await self.client.futures_change_leverage(**params)
+            self.logger.info(f"Leverage set to {leverage}x")
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to set leverage: {e}")
+            return False
+
     async def place_order(self, side, quantity, order_type='MARKET', price=None, reduce_only=False):
         """Place a futures order with optional reduceOnly flag"""
         try:
@@ -146,27 +203,4 @@ class BinanceClient:
             return order
         except BinanceAPIException as e:
             self.logger.error(f"Failed to place order: {e}")
-            raise
-
-    async def get_position(self):
-        """Get current position information"""
-        try:
-            positions = await self.client.futures_position_information(symbol=self.symbol)
-            return positions[0] if positions else None
-        except BinanceAPIException as e:
-            self.logger.error(f"Failed to get position: {e}")
-            raise
-
-    async def close(self):
-        """Close the Binance client connection"""
-        if self.client:
-            await self.client.close_connection()
-            self.logger.info("Binance client connection closed")
-
-    async def set_leverage(self, leverage):
-        """Set leverage for the trading symbol"""
-        try:
-            result = await self.client.futures_change_leverage(symbol=self.symbol, leverage=leverage)
-            self.logger.info(f"Leverage set to {leverage}x: {result}")
-        except Exception as e:
-            self.logger.error(f"Failed to set leverage: {e}") 
+            raise 
