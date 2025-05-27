@@ -392,7 +392,7 @@ class TradingBot:
             max_size = account_balance * 0.1
             
             # 최소 주문 수량 보장 (0.001 BTC)
-            min_size = 0.001 * self.klines_data['close'].iloc[-1]  # BTC 최소 수량을 USD로 변환
+            min_size = 0.01 * self.klines_data['close'].iloc[-1]  # BTC 최소 수량을 USD로 변환
             
             # 최종 사이즈 계산 및 최소/최대 제한 적용
             final_size = max(min_size, min(position_size, max_size))
@@ -402,7 +402,7 @@ class TradingBot:
         except Exception as e:
             logger.error(f"Error in calculate_dynamic_position_size: {e}")
             # 에러 발생 시 최소 주문 수량 반환
-            return 0.001 * self.klines_data['close'].iloc[-1]
+            return 0.01 * self.klines_data['close'].iloc[-1]
 
     def calculate_market_volatility(self):
         """시장 변동성 계산"""
@@ -480,7 +480,7 @@ class TradingBot:
             dynamic_position_size = dynamic_position_size / price  # USD를 BTC로 변환
             
             # 최소 주문 수량 보장 및 정밀도 조정
-            dynamic_position_size = max(0.001, round(dynamic_position_size, 3))  # 최소 0.001 BTC, 3자리까지 반올림
+            dynamic_position_size = max(0.01, round(dynamic_position_size, 3))  # 최소 0.001 BTC, 3자리까지 반올림
             
             # 신호/점수/ADX 로그
             log_msg = f"Signal: {signal}, Score: {score}, ADX: {adx}, Volatility: {volatility:.4f}, Position Size: {dynamic_position_size:.3f} BTC, Reason: {reason}"
@@ -617,6 +617,8 @@ class TradingBot:
                         position['take_profit'] = self.current_position['take_profit']
                     if 'entry' in self.current_position:
                         position['entry'] = self.current_position['entry']
+                    if 'trailing_stop' in self.current_position:
+                        position['trailing_stop'] = self.current_position['trailing_stop']
                 if 'entry' not in position and 'entryPrice' in position:
                     position['entry'] = float(position['entryPrice'])
                 if 'stop_loss' not in position or 'take_profit' not in position:
@@ -624,6 +626,9 @@ class TradingBot:
                         self.klines_data, position['entry'], side)
                     position['stop_loss'] = stop_loss
                     position['take_profit'] = take_profit
+                # trailing_stop이 없으면 stop_loss로 초기화
+                if 'trailing_stop' not in position:
+                    position['trailing_stop'] = position['stop_loss']
                 # 포지션 정보가 바뀌었을 때만 메시지 전송
                 pos_info = (position['side'], position['positionAmt'], position['entry'])
                 if self.last_position_info != pos_info:
@@ -639,6 +644,15 @@ class TradingBot:
         try:
             if not self.current_position:
                 return
+                
+            # 필수 필드 확인
+            required_fields = ['side', 'stop_loss', 'take_profit', 'entry']
+            if not all(field in self.current_position for field in required_fields):
+                logger.warning("Missing required position fields, updating position info...")
+                await self.update_position()
+                if not self.current_position:
+                    return
+                    
             side = self.current_position['side']
             stop_loss = self.current_position['stop_loss']
             take_profit = self.current_position['take_profit']
@@ -647,6 +661,9 @@ class TradingBot:
             # 트레일링 스탑 업데이트
             if self.trailing_stop_enabled:
                 new_trailing_stop = self.calculate_trailing_stop(entry_price, last_price, side)
+                if 'trailing_stop' not in self.current_position:
+                    self.current_position['trailing_stop'] = stop_loss
+                    
                 if side == 'BUY':
                     # 롱 포지션: 트레일링 스탑이 상승할 때만 업데이트
                     if new_trailing_stop > self.current_position['trailing_stop']:
