@@ -307,12 +307,28 @@ class TechnicalAnalyzer:
         avg_atr = df['atr'].rolling(window=20).mean().iloc[-1]
         is_high_volatility = atr > avg_atr * 1.5
         
-        # 8. ADX(추세 강도) 필터
+        # 8. ADX(추세 강도) 및 시장 상황 분석
         adx = df['adx'].iloc[-1]
-        if adx < 20:
-            if return_details:
-                return (0, 0, adx)
-            return 0  # 횡보장에서는 신호 무시
+        
+        # 9. 급격한 가격 변동 감지 (폭락/폭등)
+        price_change_5m = (df['close'].iloc[-1] - df['close'].iloc[-6]) / df['close'].iloc[-6] * 100 if len(df) >= 6 else 0
+        price_change_15m = (df['close'].iloc[-1] - df['close'].iloc[-16]) / df['close'].iloc[-16] * 100 if len(df) >= 16 else 0
+        
+        # 시장 상황 분류
+        market_condition = "normal"
+        
+        # 폭락/폭등 조건 (5분간 2% 이상 또는 15분간 4% 이상 변동)
+        if abs(price_change_5m) >= 2.0 or abs(price_change_15m) >= 4.0:
+            if price_change_5m > 0 or price_change_15m > 0:
+                market_condition = "pump"  # 폭등
+            else:
+                market_condition = "crash"  # 폭락
+        # 횡보장 조건 (ADX < 20 AND 변동성 낮음)
+        elif adx < 20 and not is_high_volatility:
+            market_condition = "sideways"  # 횡보
+        # 강한 추세 조건
+        elif adx >= 30:
+            market_condition = "strong_trend"  # 강한 추세
         
         # 종합 신호 생성
         signal_score = 0
@@ -331,16 +347,69 @@ class TechnicalAnalyzer:
         signal_score += bb_signal
         signal_score += supertrend_signal
         
-        # 변동성이 높은 경우 신호 임계값 상향 조정
-        threshold = 4 if is_high_volatility else 4
+        # 시장 상황별 진입 조건 조정
+        if market_condition == "crash":
+            # 폭락 시: 역추세 매수 기회 포착 (더 관대한 조건)
+            threshold_long = 2  # 매수 임계값 완화
+            threshold_short = 5  # 매도 임계값 강화 (추가 하락 방지)
+            
+            # 폭락 시 추가 매수 신호 (RSI 극도 과매도)
+            if df['rsi'].iloc[-1] < 25:
+                signal_score += 2
+                
+        elif market_condition == "pump":
+            # 폭등 시: 역추세 매도 기회 포착 (더 관대한 조건)
+            threshold_long = 5  # 매수 임계값 강화 (추가 상승 방지)
+            threshold_short = 2  # 매도 임계값 완화
+            
+            # 폭등 시 추가 매도 신호 (RSI 극도 과매수)
+            if df['rsi'].iloc[-1] > 75:
+                signal_score -= 2
+                
+        elif market_condition == "sideways":
+            # 횡보 시: 볼린저 밴드 터치 시에만 진입 (더 엄격한 조건)
+            threshold_long = 3  # 기본보다 완화
+            threshold_short = 3
+            
+            # 횡보 시에는 볼린저 밴드 신호에 가중치 추가
+            if bb_signal != 0:
+                signal_score += bb_signal * 2  # 볼린저 밴드 신호 강화
+                
+        elif market_condition == "strong_trend":
+            # 강한 추세 시: 추세 추종 (기본 조건)
+            threshold_long = 3  # 기본보다 완화
+            threshold_short = 3
+            
+            # 강한 추세 시 추세 방향 신호 강화
+            if adx >= 40:  # 매우 강한 추세
+                if price_trend == 1:
+                    signal_score += 1  # 상승 추세 강화
+                elif price_trend == -1:
+                    signal_score -= 1  # 하락 추세 강화
+        else:
+            # 일반 시장 조건
+            threshold_long = 4
+            threshold_short = 4
         
         # 최종 신호 결정
-        if signal_score >= threshold:
+        if signal_score >= threshold_long:
             result = 1
-        elif signal_score <= -threshold:
+        elif signal_score <= -threshold_short:
             result = -1
         else:
             result = 0
+            
+        # 로깅용 추가 정보
+        market_info = {
+            'condition': market_condition,
+            'price_change_5m': price_change_5m,
+            'price_change_15m': price_change_15m,
+            'threshold_long': threshold_long,
+            'threshold_short': threshold_short,
+            'adx': adx,
+            'volatility': is_high_volatility
+        }
+        
         if return_details:
-            return (result, signal_score, adx)
+            return (result, signal_score, adx, market_info)
         return result 

@@ -770,7 +770,7 @@ class TradingBot:
                         
                         # 신호, 점수, ADX 추출
                         try:
-                            technical_signal, score, adx = self.technical_analyzer.generate_comprehensive_signal(self.klines_data, return_details=True)
+                            technical_signal, score, adx, market_info = self.technical_analyzer.generate_comprehensive_signal(self.klines_data, return_details=True)
                             
                             # 신호 유효성 검증 (1분에 한 번만 경고 로그)
                             if score is None or adx is None or np.isnan(score) or np.isnan(adx):
@@ -786,6 +786,8 @@ class TradingBot:
                         # 디버깅: 신호 정보 로그 (1분에 한 번)
                         if self.should_log_signal_warning():
                             logger.info(f"🔍 Signal Debug - Signal: {technical_signal}, Score: {score:.3f}, ADX: {adx:.3f}")
+                            logger.info(f"📊 Market Condition: {market_info['condition']}, Price Change 5m: {market_info['price_change_5m']:.2f}%, 15m: {market_info['price_change_15m']:.2f}%")
+                            logger.info(f"🎯 Thresholds - Long: {market_info['threshold_long']}, Short: {market_info['threshold_short']}")
                         
                         # 신호 히스토리 관리
                         self.signal_history.append((technical_signal, score, adx))
@@ -825,16 +827,17 @@ class TradingBot:
                         else:
                             # reversal 진입
                             if self.current_position and reversal_confirmed:
-                                logger.info(f"🔄 Executing reversal trade: {technical_signal}")
+                                logger.info(f"🔄 Executing reversal trade: {technical_signal} (Market: {market_info['condition']})")
                                 await self.close_position("Technical signal reversal")
-                                await self.execute_trade(technical_signal, kline['close'], "Technical analysis (reversal)", reverse=True, score=score, adx=adx)
+                                await self.execute_trade(technical_signal, kline['close'], f"Technical analysis (reversal) - {market_info['condition']}", reverse=True, score=score, adx=adx)
                             # 신규 진입
                             elif not self.current_position and confirmed:
-                                logger.info(f"🚀 Executing new trade: {technical_signal}")
-                                await self.execute_trade(technical_signal, kline['close'], "Technical analysis", score=score, adx=adx)
+                                logger.info(f"🚀 Executing new trade: {technical_signal} (Market: {market_info['condition']})")
+                                await self.execute_trade(technical_signal, kline['close'], f"Technical analysis - {market_info['condition']}", score=score, adx=adx)
                             elif not self.current_position and self.should_log_signal_warning():
                                 # 진입하지 않는 이유 로그
-                                logger.info(f"❌ No trade executed - Signal: {technical_signal}, Confirmed: {confirmed}, Score: {score:.3f}, ADX: {adx:.3f}")
+                                logger.info(f"❌ No trade executed - Signal: {technical_signal}, Confirmed: {confirmed}, Score: {score:.3f}, ADX: {adx:.3f}, Market: {market_info['condition']}")
+                                logger.info(f"📊 Required thresholds - Long: {market_info['threshold_long']}, Short: {market_info['threshold_short']}")
                         
                         await self.monitor_position(kline['close'])
                         await self.update_position()
