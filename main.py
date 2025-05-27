@@ -684,12 +684,14 @@ class TradingBot:
                     if new_trailing_stop > trailing_stop:
                         self.current_position['trailing_stop'] = new_trailing_stop
                         trailing_stop = new_trailing_stop
+                        # 트레일링 스탑 업데이트는 로그로만 기록
                         logger.info(f"Updated trailing stop for LONG position: {trailing_stop:.2f}")
                 else:
                     # 숏 포지션: 트레일링 스탑이 하락할 때만 업데이트
                     if new_trailing_stop < trailing_stop:
                         self.current_position['trailing_stop'] = new_trailing_stop
                         trailing_stop = new_trailing_stop
+                        # 트레일링 스탑 업데이트는 로그로만 기록
                         logger.info(f"Updated trailing stop for SHORT position: {trailing_stop:.2f}")
             
             # 항상 실시간 포지션 수량 조회
@@ -709,18 +711,22 @@ class TradingBot:
                 if last_price <= trailing_stop or last_price >= take_profit:
                     try:
                         await self.binance.place_order('SELL', qty, order_type='MARKET', reduce_only=True)
+                        # 청산 메시지는 텔레그램으로 전송
+                        close_reason = '트레일링 스탑' if last_price <= trailing_stop else '익절'
                         await self.telegram.send_message(
-                            f"[AUTO CLOSE] 롱 포지션 청산\n"
-                            f"가격: {last_price:.2f}\n"
+                            f"🔔 포지션 청산 알림\n"
+                            f"방향: 롱\n"
+                            f"청산가: {last_price:.2f}\n"
                             f"수익률: {pnl:.2%}\n"
-                            f"청산 사유: {'트레일링 스탑' if last_price <= trailing_stop else '익절'}"
+                            f"사유: {close_reason}"
                         )
                         closed = True
                         if pnl > 0:
                             self.winning_trades += 1
                     except Exception as e:
                         logger.error(f"Error closing LONG position: {e}")
-                        await self.telegram.send_error(f"Error closing LONG position: {e}")
+                        # 청산 실패 시에만 에러 메시지 전송
+                        await self.telegram.send_error(f"❌ 롱 포지션 청산 실패: {e}")
                         
             elif side == 'SELL':
                 pnl = (entry_price - last_price) / entry_price
@@ -728,18 +734,22 @@ class TradingBot:
                 if last_price >= trailing_stop or last_price <= take_profit:
                     try:
                         await self.binance.place_order('BUY', qty, order_type='MARKET', reduce_only=True)
+                        # 청산 메시지는 텔레그램으로 전송
+                        close_reason = '트레일링 스탑' if last_price >= trailing_stop else '익절'
                         await self.telegram.send_message(
-                            f"[AUTO CLOSE] 숏 포지션 청산\n"
-                            f"가격: {last_price:.2f}\n"
+                            f"🔔 포지션 청산 알림\n"
+                            f"방향: 숏\n"
+                            f"청산가: {last_price:.2f}\n"
                             f"수익률: {pnl:.2%}\n"
-                            f"청산 사유: {'트레일링 스탑' if last_price >= trailing_stop else '익절'}"
+                            f"사유: {close_reason}"
                         )
                         closed = True
                         if pnl > 0:
                             self.winning_trades += 1
                     except Exception as e:
                         logger.error(f"Error closing SHORT position: {e}")
-                        await self.telegram.send_error(f"Error closing SHORT position: {e}")
+                        # 청산 실패 시에만 에러 메시지 전송
+                        await self.telegram.send_error(f"❌ 숏 포지션 청산 실패: {e}")
             
             # 승률 계산
             if self.total_trades > 0:
@@ -757,7 +767,9 @@ class TradingBot:
                         
         except Exception as e:
             logger.error(f"Error in monitor_position: {e}")
-            await self.telegram.send_error(f"Error in monitor_position: {e}")
+            # 실제 에러 발생 시에만 텔레그램으로 전송
+            if "position" in str(e).lower() or "order" in str(e).lower():
+                await self.telegram.send_error(f"⚠️ 포지션 모니터링 에러: {e}")
             # 에러 발생 시 포지션 정보 업데이트 시도
             try:
                 await self.update_position()
@@ -886,7 +898,7 @@ class TradingBot:
         """메인 실행 함수"""
         try:
             logger.info("Starting trading bot...")
-            await self.telegram.send_message("🤖 Trading bot started")
+            await self.telegram.send_message("🤖 트레이딩 봇 시작")
             
             # 1. 초기 설정
             await self.setup()
@@ -902,10 +914,12 @@ class TradingBot:
                     'take_profit': None,  # 동적 익절가로 업데이트될 예정
                     'stop_loss': position['stopLoss']
                 }
+                # 기존 포지션 발견 시 한 번만 알림
                 await self.telegram.send_message(
-                    f"🔄 Found existing {self.current_position['side']} position\n"
-                    f"Entry: {self.current_position['entry']}\n"
-                    f"Size: {self.current_position['size']} BTC"
+                    f"🔄 기존 포지션 발견\n"
+                    f"방향: {self.current_position['side']}\n"
+                    f"진입가: {self.current_position['entry']}\n"
+                    f"수량: {self.current_position['size']} BTC"
                 )
             
             while True:
@@ -918,9 +932,9 @@ class TradingBot:
                     await self.update_market_data()
                     
                     # 5. 시그널 생성
-                    signal, score, adx, market_condition = self.analyzer.generate_signals(self.klines_data)
+                    signal, score, adx, market_condition = self.technical_analyzer.generate_signals(self.klines_data)
                     
-                    # 6. 시장 상태 로깅
+                    # 6. 시장 상태 로깅 (로그로만 기록)
                     logger.info(f"Signal: {signal}, Score: {score}, ADX: {adx}, Market: {market_condition}")
                     
                     # 7. 포지션이 없는 경우에만 새로운 진입 고려
@@ -935,12 +949,14 @@ class TradingBot:
                     
                 except Exception as e:
                     logger.error(f"Error in main loop: {e}")
-                    await self.telegram.send_error(f"Error in main loop: {e}")
+                    # 실제 에러 발생 시에만 텔레그램으로 전송
+                    if "position" in str(e).lower() or "order" in str(e).lower():
+                        await self.telegram.send_error(f"⚠️ 메인 루프 에러: {e}")
                     await asyncio.sleep(5)
                     
         except Exception as e:
             logger.error(f"Fatal error: {e}")
-            await self.telegram.send_error(f"Fatal error: {e}")
+            await self.telegram.send_error(f"❌ 치명적 에러: {e}")
         finally:
             await self.cleanup()
 
