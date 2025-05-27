@@ -496,7 +496,7 @@ class TradingBot:
 
             if signal == 1 and (not self.current_position or reverse):  # Buy signal
                 stop_loss, take_profit = self.technical_analyzer.calculate_stop_loss_take_profit(
-                    self.klines_data, price, 'BUY', leverage=leverage)
+                    self.klines_data, price, 'BUY')
                 await self.binance.place_order('BUY', dynamic_position_size)
                 self.current_position = {
                     'side': 'BUY', 
@@ -514,7 +514,7 @@ class TradingBot:
                 )
             elif signal == -1 and (not self.current_position or reverse):  # Sell signal
                 stop_loss, take_profit = self.technical_analyzer.calculate_stop_loss_take_profit(
-                    self.klines_data, price, 'SELL', leverage=leverage)
+                    self.klines_data, price, 'SELL')
                 await self.binance.place_order('SELL', dynamic_position_size)
                 self.current_position = {
                     'side': 'SELL', 
