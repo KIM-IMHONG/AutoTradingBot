@@ -34,12 +34,12 @@ class TradingBot:
         self.news_threshold = 0.7  # 뉴스 영향도 임계값
         self.last_position_info = None
         self.last_trade_time = None  # 마지막 거래 시간
-        self.min_trade_interval = 60  # 최소 거래 간격 (초) - 300초에서 60초로 완화
+        self.min_trade_interval = 30  # 최소 거래 간격 (초) - 60초에서 30초로 완화
         self.signal_confirmation_count = 0  # 신호 확인 카운트
-        self.required_signal_confirmation = 2  # 필요한 신호 확인 횟수 - 3에서 2로 완화
+        self.required_signal_confirmation = 1  # 필요한 신호 확인 횟수 - 2에서 1로 완화
         self.last_signal = 0  # 마지막 신호
         self.signal_history = []  # (signal, score, adx)
-        self.signal_history_limit = 10
+        self.signal_history_limit = 5  # 10에서 5로 감소
         self.reversal_confirmation = 0
         # 새로운 개선 사항들
         self.account_balance = 0  # 계좌 잔고
@@ -489,9 +489,9 @@ class TradingBot:
                     self.signal_confirmation_count += 1
                     logger.info(f"🔄 Signal {signal} confirmed {self.signal_confirmation_count} times")
 
-                # 조건 완화: 3회 → 2회 확인으로 변경
-                if self.signal_confirmation_count < 2:  # required_signal_confirmation을 2로 완화
-                    logger.info(f"⏳ Waiting for signal confirmation: {self.signal_confirmation_count}/2")
+                # 조건 완화: 2회 → 1회 확인으로 변경
+                if self.signal_confirmation_count < 1:  # required_signal_confirmation을 1로 완화
+                    logger.info(f"⏳ Waiting for signal confirmation: {self.signal_confirmation_count}/1")
                     return
 
             if signal == 1 and (not self.current_position or reverse):  # Buy signal
@@ -792,8 +792,8 @@ class TradingBot:
                         if len(self.signal_history) > self.signal_history_limit:
                             self.signal_history.pop(0)
                         
-                        # 신호 연속 유지 시간 체크 (조건 완화: 3분 → 2분)
-                        last_signals = [s[0] for s in self.signal_history[-2:]]  # 5분 → 2분으로 완화
+                        # 신호 연속 유지 시간 체크 (조건 완화: 2분 → 30초)
+                        last_signals = [s[0] for s in self.signal_history[-2:]]  # 2분 → 30초로 완화
                         if len(last_signals) >= 2 and all(s == technical_signal and s != 0 for s in last_signals):
                             confirmed = True
                         else:
@@ -801,16 +801,16 @@ class TradingBot:
                         
                         # 디버깅: 신호 확인 상태 로그
                         if self.should_log_signal_warning():
-                            logger.info(f"🔍 Signal History: {[s[0] for s in self.signal_history[-5:]]}")
+                            logger.info(f"🔍 Signal History: {[s[0] for s in self.signal_history[-3:]]}")
                             logger.info(f"🔍 Confirmed: {confirmed}, Current Position: {bool(self.current_position)}")
                             logger.info(f"🔍 News Impact: {self.last_news_impact:.3f} (threshold: {self.news_threshold})")
                         
-                        # reversal 진입(2분 연속) 체크 (조건 완화)
+                        # reversal 진입(30초 연속) 체크 (조건 완화)
                         reversal_confirmed = False
                         if self.current_position:
                             current_side = 'LONG' if float(self.current_position.get('positionAmt', 0)) > 0 else 'SHORT'
                             if (technical_signal == 1 and current_side == 'SHORT') or (technical_signal == -1 and current_side == 'LONG'):
-                                last_rev_signals = [s[0] for s in self.signal_history[-2:]]  # 3분 → 2분으로 완화
+                                last_rev_signals = [s[0] for s in self.signal_history[-2:]]  # 2분 → 30초로 완화
                                 if len(last_rev_signals) >= 2 and all(s == technical_signal and s != 0 for s in last_rev_signals):
                                     reversal_confirmed = True
                         
