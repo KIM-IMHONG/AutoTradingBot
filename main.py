@@ -734,6 +734,106 @@ class TradingBot:
         except Exception as e:
             logger.error(f"Error in send_performance_report: {e}")
 
+    async def setup(self):
+        """Initialize all components and setup the trading environment"""
+        try:
+            # 1. Initialize components
+            await self.initialize()
+            
+            # 2. Start news monitoring
+            asyncio.create_task(
+                self.news_collector.monitor_news(self.handle_news_impact)
+            )
+            
+            # 3. Start periodic performance report (every hour)
+            async def periodic_report():
+                while True:
+                    await asyncio.sleep(3600)  # 1 hour
+                    await self.send_performance_report()
+            
+            asyncio.create_task(periodic_report())
+            
+            # 4. Start klines streaming
+            async def handle_kline(kline):
+                try:
+                    has_enough_data = await self.update_klines(kline)
+                    if not has_enough_data:
+                        return
+                    
+                    # 데이터가 100개 이상 쌓였을 때만 지표 컬럼 체크 및 신호 생성
+                    if len(self.klines_data) < 100:
+                        if not self.data_accumulation_complete:
+                            logger.info(f"📊 Waiting for more data: {len(self.klines_data)}/100")
+                        return
+                    
+                    # 데이터 무결성 재검증
+                    if not self.validate_data_integrity():
+                        logger.warning("Data integrity check failed, skipping signal generation")
+                        return
+                    
+                    # 실시간 데이터로 지표 업데이트
+                    try:
+                        self.klines_data = self.technical_analyzer.calculate_indicators(self.klines_data)
+                    except Exception as e:
+                        logger.error(f"Error calculating indicators: {e}")
+                        return
+                    
+                    # 지표 컬럼 존재 확인
+                    indicator_cols = ['ema_short','ema_medium','ema_long','rsi','macd','macd_signal','macd_diff','bb_high','bb_low','stoch_k','stoch_d','atr','supertrend','adx']
+                    missing_cols = [col for col in indicator_cols if col not in self.klines_data.columns]
+                    if missing_cols:
+                        logger.warning(f'Missing indicator columns: {missing_cols}, skipping signal generation.')
+                        return
+                    
+                    # NaN 값 확인 및 처리
+                    if self.should_check_nan_values():
+                        nan_cols = [col for col in indicator_cols if self.klines_data[col].isnull().any()]
+                        if nan_cols:
+                            logger.warning(f'NaN detected in indicators: {nan_cols}')
+                            recent_data = self.klines_data.tail(10)
+                            if recent_data[indicator_cols].isnull().any().any():
+                                logger.warning('NaN in recent indicator data, skipping signal generation.')
+                                return
+                    
+                    # 포지션 모니터링
+                    await self.monitor_position(kline['close'])
+                    await self.update_position()
+                    
+                except Exception as e:
+                    logger.error(f"Error in handle_kline: {e}")
+                    await self.telegram.send_error(f"Error in handle_kline: {e}")
+            
+            # Start WebSocket streaming
+            await self.binance.stream_klines(handle_kline)
+            
+        except Exception as e:
+            logger.error(f"Error in setup: {e}")
+            await self.telegram.send_error(f"Error in setup: {e}")
+            raise  # Re-raise the exception to be caught by the run method
+
+    async def update_market_data(self):
+        """Update market data and indicators"""
+        try:
+            # Get latest kline data
+            klines = await self.binance.get_klines(limit=100)
+            if not klines:
+                return
+                
+            # Update klines data
+            self.klines_data = pd.DataFrame(klines)
+            
+            # Calculate indicators
+            self.klines_data = self.technical_analyzer.calculate_indicators(self.klines_data)
+            
+            # Validate data integrity
+            if not self.validate_data_integrity():
+                logger.warning("Data integrity check failed after market data update")
+                return
+                
+        except Exception as e:
+            logger.error(f"Error in update_market_data: {e}")
+            await self.telegram.send_error(f"Error in update_market_data: {e}")
+
     async def run(self):
         """메인 실행 함수"""
         try:
@@ -802,41 +902,92 @@ class TradingBot:
         await self.telegram.close()
 
     def calculate_dynamic_take_profit(self, df, entry_price, side, current_price):
-        """동적 익절 전략 계산"""
+        """동적 익절 전략 계산 - 개선된 버전"""
         try:
-            # 1. 추세 강도 분석
+            # 1. 추세 강도 분석 (ADX 기반)
             adx = df['adx'].iloc[-1]
-            trend_strength = "strong" if adx > 30 else "weak"
+            adx_ma = df['adx'].rolling(20).mean().iloc[-1]
+            trend_strength = "strong" if adx > max(30, adx_ma * 1.2) else "weak"
             
-            # 2. 모멘텀 분석
+            # 2. 모멘텀 분석 (RSI, Stochastic, MACD)
             rsi = df['rsi'].iloc[-1]
             stoch_k = df['stoch_k'].iloc[-1]
-            momentum = "strong" if (side == 'BUY' and rsi > 60 and stoch_k > 80) or \
-                                 (side == 'SELL' and rsi < 40 and stoch_k < 20) else "weak"
+            stoch_d = df['stoch_d'].iloc[-1]
+            macd = df['macd'].iloc[-1]
+            macd_signal = df['macd_signal'].iloc[-1]
             
-            # 3. 변동성 분석
+            # 모멘텀 강도 계산
+            momentum_score = 0
+            if side == 'BUY':
+                if rsi > 60: momentum_score += 1
+                if stoch_k > 80 and stoch_k > stoch_d: momentum_score += 1
+                if macd > macd_signal: momentum_score += 1
+            else:
+                if rsi < 40: momentum_score += 1
+                if stoch_k < 20 and stoch_k < stoch_d: momentum_score += 1
+                if macd < macd_signal: momentum_score += 1
+                
+            momentum = "strong" if momentum_score >= 2 else "weak"
+            
+            # 3. 변동성 분석 (ATR, Bollinger Bands)
             atr = df['atr'].iloc[-1]
-            volatility = "high" if atr > df['atr'].rolling(20).mean().iloc[-1] * 1.5 else "normal"
+            atr_ma = df['atr'].rolling(20).mean().iloc[-1]
+            bb_width = (df['bb_high'].iloc[-1] - df['bb_low'].iloc[-1]) / df['bb_mid'].iloc[-1]
+            bb_width_ma = ((df['bb_high'].rolling(20).mean().iloc[-1] - 
+                           df['bb_low'].rolling(20).mean().iloc[-1]) / 
+                          df['bb_mid'].rolling(20).mean().iloc[-1])
             
-            # 4. 익절가 계산
-            base_tp = entry_price + (atr * 2.5) if side == 'BUY' else entry_price - (atr * 2.5)
+            volatility = "high" if (atr > atr_ma * 1.5 or bb_width > bb_width_ma * 1.5) else "normal"
+            
+            # 4. 기본 익절가 계산 (ATR 기반)
+            atr_multiplier = 2.5  # 기본 승수
+            if trend_strength == "strong":
+                atr_multiplier += 0.5  # 강한 추세에서는 더 높은 익절가
+            if volatility == "high":
+                atr_multiplier -= 0.5  # 높은 변동성에서는 더 낮은 익절가
+                
+            base_tp = entry_price + (atr * atr_multiplier) if side == 'BUY' else entry_price - (atr * atr_multiplier)
             
             # 5. 조건별 조정
             if trend_strength == "strong" and momentum == "strong":
-                # 추세가 강하고 모멘텀도 강할 때
+                # 강한 추세와 모멘텀
                 if side == 'BUY':
-                    return max(base_tp, current_price * 1.02)  # 최소 2% 추가 상승 기대
+                    # 롱 포지션: 최소 2% 추가 상승 기대
+                    min_tp = current_price * 1.02
+                    # 볼린저 밴드 상단을 고려
+                    bb_tp = df['bb_high'].iloc[-1] * 1.01  # 밴드 상단 + 1%
+                    return max(base_tp, min_tp, bb_tp)
                 else:
-                    return min(base_tp, current_price * 0.98)  # 최소 2% 추가 하락 기대
+                    # 숏 포지션: 최소 2% 추가 하락 기대
+                    max_tp = current_price * 0.98
+                    # 볼린저 밴드 하단을 고려
+                    bb_tp = df['bb_low'].iloc[-1] * 0.99  # 밴드 하단 - 1%
+                    return min(base_tp, max_tp, bb_tp)
+                    
             elif trend_strength == "weak" or volatility == "high":
-                # 추세가 약하거나 변동성이 높을 때
-                return base_tp  # 기본 익절가 사용
-                
-            return base_tp
+                # 약한 추세나 높은 변동성
+                if side == 'BUY':
+                    # 롱 포지션: 더 보수적인 익절가
+                    return min(base_tp, current_price * 1.01)  # 최대 1% 추가 상승
+                else:
+                    # 숏 포지션: 더 보수적인 익절가
+                    return max(base_tp, current_price * 0.99)  # 최대 1% 추가 하락
             
+            # 6. 최종 익절가 검증
+            if side == 'BUY':
+                # 롱 포지션: 현재가보다 낮은 익절가는 방지
+                return max(base_tp, current_price * 1.005)  # 최소 0.5% 추가 상승
+            else:
+                # 숏 포지션: 현재가보다 높은 익절가는 방지
+                return min(base_tp, current_price * 0.995)  # 최소 0.5% 추가 하락
+                
         except Exception as e:
             logger.error(f"Error in calculate_dynamic_take_profit: {e}")
-            return base_tp
+            # 에러 발생 시 기본 익절가 반환
+            if side == 'BUY':
+                return entry_price * 1.01  # 기본 1% 익절
+            else:
+                return entry_price * 0.99  # 기본 1% 익절
 
     def detect_trend_reversal(self, df):
         """추세 전환 감지"""
