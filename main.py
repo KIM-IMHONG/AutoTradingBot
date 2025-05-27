@@ -645,33 +645,52 @@ class TradingBot:
             if not self.current_position:
                 return
                 
-            # 필수 필드 확인
-            required_fields = ['side', 'stop_loss', 'take_profit', 'entry']
-            if not all(field in self.current_position for field in required_fields):
-                logger.warning("Missing required position fields, updating position info...")
-                await self.update_position()
-                if not self.current_position:
-                    return
+            # 필수 필드 확인 및 초기화
+            required_fields = ['side', 'stop_loss', 'take_profit', 'entry', 'size']
+            for field in required_fields:
+                if field not in self.current_position:
+                    logger.warning(f"Missing {field} in position, initializing...")
+                    if field == 'trailing_stop':
+                        self.current_position[field] = self.current_position['stop_loss']
+                    elif field == 'size':
+                        position = await self.binance.get_position()
+                        if position:
+                            self.current_position[field] = abs(float(position['positionAmt']))
+                        else:
+                            self.current_position[field] = 0
+                    else:
+                        await self.update_position()
+                        if not self.current_position:
+                            return
+                        break
                     
             side = self.current_position['side']
-            stop_loss = self.current_position['stop_loss']
-            take_profit = self.current_position['take_profit']
-            entry_price = self.current_position['entry']
+            stop_loss = float(self.current_position['stop_loss'])
+            take_profit = float(self.current_position['take_profit'])
+            entry_price = float(self.current_position['entry'])
+            position_size = float(self.current_position['size'])
+            
+            # 트레일링 스탑 초기화 확인
+            if 'trailing_stop' not in self.current_position:
+                self.current_position['trailing_stop'] = stop_loss
+            trailing_stop = float(self.current_position['trailing_stop'])
             
             # 트레일링 스탑 업데이트
             if self.trailing_stop_enabled:
                 new_trailing_stop = self.calculate_trailing_stop(entry_price, last_price, side)
-                if 'trailing_stop' not in self.current_position:
-                    self.current_position['trailing_stop'] = stop_loss
-                    
+                
                 if side == 'BUY':
                     # 롱 포지션: 트레일링 스탑이 상승할 때만 업데이트
-                    if new_trailing_stop > self.current_position['trailing_stop']:
+                    if new_trailing_stop > trailing_stop:
                         self.current_position['trailing_stop'] = new_trailing_stop
+                        trailing_stop = new_trailing_stop
+                        logger.info(f"Updated trailing stop for LONG position: {trailing_stop:.2f}")
                 else:
                     # 숏 포지션: 트레일링 스탑이 하락할 때만 업데이트
-                    if new_trailing_stop < self.current_position['trailing_stop']:
+                    if new_trailing_stop < trailing_stop:
                         self.current_position['trailing_stop'] = new_trailing_stop
+                        trailing_stop = new_trailing_stop
+                        logger.info(f"Updated trailing stop for SHORT position: {trailing_stop:.2f}")
             
             # 항상 실시간 포지션 수량 조회
             position = await self.binance.get_position()
@@ -679,42 +698,71 @@ class TradingBot:
             if abs(amt) < 1e-4:  # 최소 단위 미만이면 포지션 없음
                 self.current_position = None
                 return
+                
             qty = abs(amt)
             closed = False
             
             # 손익 계산
             if side == 'BUY':
                 pnl = (last_price - entry_price) / entry_price
-                if last_price <= self.current_position['trailing_stop'] or last_price >= take_profit:
-                    await self.binance.place_order('SELL', qty, order_type='MARKET', reduce_only=True)
-                    await self.telegram.send_message(f"[AUTO CLOSE] 롱 포지션 청산 @ {last_price:.2f}, PnL: {pnl:.2%}")
-                    closed = True
-                    if pnl > 0:
-                        self.winning_trades += 1
+                # 트레일링 스탑 또는 익절가 도달 시 청산
+                if last_price <= trailing_stop or last_price >= take_profit:
+                    try:
+                        await self.binance.place_order('SELL', qty, order_type='MARKET', reduce_only=True)
+                        await self.telegram.send_message(
+                            f"[AUTO CLOSE] 롱 포지션 청산\n"
+                            f"가격: {last_price:.2f}\n"
+                            f"수익률: {pnl:.2%}\n"
+                            f"청산 사유: {'트레일링 스탑' if last_price <= trailing_stop else '익절'}"
+                        )
+                        closed = True
+                        if pnl > 0:
+                            self.winning_trades += 1
+                    except Exception as e:
+                        logger.error(f"Error closing LONG position: {e}")
+                        await self.telegram.send_error(f"Error closing LONG position: {e}")
+                        
             elif side == 'SELL':
                 pnl = (entry_price - last_price) / entry_price
-                if last_price >= self.current_position['trailing_stop'] or last_price <= take_profit:
-                    await self.binance.place_order('BUY', qty, order_type='MARKET', reduce_only=True)
-                    await self.telegram.send_message(f"[AUTO CLOSE] 숏 포지션 청산 @ {last_price:.2f}, PnL: {pnl:.2%}")
-                    closed = True
-                    if pnl > 0:
-                        self.winning_trades += 1
+                # 트레일링 스탑 또는 익절가 도달 시 청산
+                if last_price >= trailing_stop or last_price <= take_profit:
+                    try:
+                        await self.binance.place_order('BUY', qty, order_type='MARKET', reduce_only=True)
+                        await self.telegram.send_message(
+                            f"[AUTO CLOSE] 숏 포지션 청산\n"
+                            f"가격: {last_price:.2f}\n"
+                            f"수익률: {pnl:.2%}\n"
+                            f"청산 사유: {'트레일링 스탑' if last_price >= trailing_stop else '익절'}"
+                        )
+                        closed = True
+                        if pnl > 0:
+                            self.winning_trades += 1
+                    except Exception as e:
+                        logger.error(f"Error closing SHORT position: {e}")
+                        await self.telegram.send_error(f"Error closing SHORT position: {e}")
             
             # 승률 계산
             if self.total_trades > 0:
                 self.win_rate = self.winning_trades / self.total_trades
                 
             if closed:
-                for _ in range(10):
+                # 청산 확인 및 포지션 초기화
+                for _ in range(10):  # 최대 10초 대기
                     await asyncio.sleep(1)
                     position = await self.binance.get_position()
                     amt = float(position['positionAmt']) if position else 0
                     if abs(amt) < 1e-4:
                         self.current_position = None
                         break
+                        
         except Exception as e:
             logger.error(f"Error in monitor_position: {e}")
             await self.telegram.send_error(f"Error in monitor_position: {e}")
+            # 에러 발생 시 포지션 정보 업데이트 시도
+            try:
+                await self.update_position()
+            except:
+                pass
 
     async def send_performance_report(self):
         """성과 보고서 전송"""
