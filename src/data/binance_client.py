@@ -127,8 +127,8 @@ class BinanceClient:
             self.logger.error(f"Unexpected error in kline stream: {e}")
             raise
 
-    async def place_order(self, side, quantity, order_type='MARKET', reduce_only=False):
-        """Place an order with proper quantity precision"""
+    async def place_order(self, side, quantity, order_type='MARKET', price=None, reduce_only=False):
+        """Place a futures order with optional reduceOnly flag"""
         try:
             # 수량 정밀도 조정 (BTC의 경우 3자리까지)
             quantity = round(quantity, 3)
@@ -138,19 +138,22 @@ class BinanceClient:
                 quantity = 0.001
                 
             params = {
-                'symbol': TRADING_SYMBOL,
+                'symbol': self.symbol,
                 'side': side,
                 'type': order_type,
-                'quantity': quantity,
-                'reduceOnly': reduce_only
+                'quantity': quantity
             }
-            
+            if price and order_type == 'LIMIT':
+                params['price'] = price
+                params['timeInForce'] = 'GTC'
+            if reduce_only:
+                params['reduceOnly'] = True
             order = await self.client.futures_create_order(**params)
-            self.logger.info(f"Order placed: {side} {quantity} {TRADING_SYMBOL}")
+            self.logger.info(f"Order placed successfully: {order}")
             return order
-        except Exception as e:
+        except BinanceAPIException as e:
             self.logger.error(f"Failed to place order: {e}")
-            return None
+            raise
 
     async def get_position(self):
         """Get current position information"""

@@ -390,11 +390,19 @@ class TradingBot:
             
             # 최대 포지션 사이즈 제한 (계좌 잔고의 10%)
             max_size = account_balance * 0.1
-            return min(position_size, max_size)
+            
+            # 최소 주문 수량 보장 (0.001 BTC)
+            min_size = 0.001 * self.klines_data['close'].iloc[-1]  # BTC 최소 수량을 USD로 변환
+            
+            # 최종 사이즈 계산 및 최소/최대 제한 적용
+            final_size = max(min_size, min(position_size, max_size))
+            
+            return final_size
             
         except Exception as e:
             logger.error(f"Error in calculate_dynamic_position_size: {e}")
-            return POSITION_SIZE  # 기본값 반환
+            # 에러 발생 시 최소 주문 수량 반환
+            return 0.001 * self.klines_data['close'].iloc[-1]
 
     def calculate_market_volatility(self):
         """시장 변동성 계산"""
@@ -470,6 +478,9 @@ class TradingBot:
             # 동적 포지션 사이즈 계산 (BTC 단위로 변환)
             dynamic_position_size = self.calculate_dynamic_position_size(score or 0.5, volatility, self.account_balance)
             dynamic_position_size = dynamic_position_size / price  # USD를 BTC로 변환
+            
+            # 최소 주문 수량 보장 및 정밀도 조정
+            dynamic_position_size = max(0.001, round(dynamic_position_size, 3))  # 최소 0.001 BTC, 3자리까지 반올림
             
             # 신호/점수/ADX 로그
             log_msg = f"Signal: {signal}, Score: {score}, ADX: {adx}, Volatility: {volatility:.4f}, Position Size: {dynamic_position_size:.3f} BTC, Reason: {reason}"
