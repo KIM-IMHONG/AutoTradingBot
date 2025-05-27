@@ -735,178 +735,241 @@ class TradingBot:
             logger.error(f"Error in send_performance_report: {e}")
 
     async def run(self):
-        """Main trading loop"""
-        while True:  # 무한 루프로 자동 재시작
-            try:
-                await self.initialize()
-
-                # Start news monitoring
-                asyncio.create_task(
-                    self.news_collector.monitor_news(self.handle_news_impact)
+        """메인 실행 함수"""
+        try:
+            logger.info("Starting trading bot...")
+            await self.telegram.send_message("🤖 Trading bot started")
+            
+            # 1. 초기 설정
+            await self.setup()
+            
+            # 2. 기존 포지션 확인 및 처리
+            position = await self.binance.get_position()
+            if position and float(position['positionAmt']) != 0:
+                logger.info("Found existing position, initializing...")
+                self.current_position = {
+                    'side': 'BUY' if float(position['positionAmt']) > 0 else 'SELL',
+                    'entry': position['entryPrice'],
+                    'size': abs(float(position['positionAmt'])),
+                    'take_profit': None,  # 동적 익절가로 업데이트될 예정
+                    'stop_loss': position['stopLoss']
+                }
+                await self.telegram.send_message(
+                    f"🔄 Found existing {self.current_position['side']} position\n"
+                    f"Entry: {self.current_position['entry']}\n"
+                    f"Size: {self.current_position['size']} BTC"
                 )
-
-                # 성과 보고서 정기 전송 (1시간마다)
-                async def periodic_report():
-                    while True:
-                        await asyncio.sleep(3600)  # 1시간 대기
-                        await self.send_performance_report()
-
-                asyncio.create_task(periodic_report())
-
-                # Start klines streaming
-                async def handle_kline(kline):
-                    try:
-                        has_enough_data = await self.update_klines(kline)
-                        if not has_enough_data:
-                            return
-                        
-                        # 데이터가 100개 이상 쌓였을 때만 지표 컬럼 체크 및 신호 생성
-                        if len(self.klines_data) < 100:
-                            # 데이터 축적 완료 전에만 로그 출력
-                            if not self.data_accumulation_complete:
-                                logger.info(f"📊 Waiting for more data: {len(self.klines_data)}/100")
-                            return
-                        
-                        # 데이터 무결성 재검증
-                        if not self.validate_data_integrity():
-                            logger.warning("Data integrity check failed, skipping signal generation")
-                            return
-                        
-                        # 실시간 데이터로 지표 업데이트 (안전한 계산)
-                        try:
-                            self.klines_data = self.technical_analyzer.calculate_indicators(self.klines_data)
-                        except Exception as e:
-                            logger.error(f"Error calculating indicators: {e}")
-                            return
-                        
-                        # 지표 컬럼 존재 확인
-                        indicator_cols = ['ema_short','ema_medium','ema_long','rsi','macd','macd_signal','macd_diff','bb_high','bb_low','stoch_k','stoch_d','atr','supertrend','adx']
-                        missing_cols = [col for col in indicator_cols if col not in self.klines_data.columns]
-                        if missing_cols:
-                            logger.warning(f'Missing indicator columns: {missing_cols}, skipping signal generation.')
-                            return
-                        
-                        # NaN 값 확인 및 처리 (1분에 한 번만, 데이터 축적 완료 후)
-                        if self.should_check_nan_values():
-                            nan_cols = [col for col in indicator_cols if self.klines_data[col].isnull().any()]
-                            if nan_cols:
-                                logger.warning(f'NaN detected in indicators: {nan_cols}')
-                                # 최근 몇 개 행만 확인 (전체가 아닌)
-                                recent_data = self.klines_data.tail(10)
-                                if recent_data[indicator_cols].isnull().any().any():
-                                    logger.warning('NaN in recent indicator data, skipping signal generation.')
-                                    return
-                        
-                        # 신호, 점수, ADX 추출
-                        try:
-                            technical_signal, score, adx, market_info = self.technical_analyzer.generate_comprehensive_signal(self.klines_data, return_details=True)
-                            
-                            # 신호 유효성 검증 (1분에 한 번만 경고 로그)
-                            if score is None or adx is None or np.isnan(score) or np.isnan(adx):
-                                if self.should_log_signal_warning():
-                                    logger.warning("Invalid signal data received, skipping")
-                                return
-                                
-                        except Exception as e:
-                            if self.should_log_signal_warning():
-                                logger.error(f"Error generating signal: {e}")
-                            return
-                        
-                        # 디버깅: 신호 정보 로그 (1분에 한 번)
-                        if self.should_log_signal_warning():
-                            logger.info(f"🔍 Signal Debug - Signal: {technical_signal}, Score: {score:.3f}, ADX: {adx:.3f}")
-                            logger.info(f"📊 Market Condition: {market_info['condition']}, Price Change 5m: {market_info['price_change_5m']:.2f}%, 15m: {market_info['price_change_15m']:.2f}%")
-                            logger.info(f"🎯 Thresholds - Long: {market_info['threshold_long']}, Short: {market_info['threshold_short']}")
-                        
-                        # 신호 히스토리 관리
-                        self.signal_history.append((technical_signal, score, adx))
-                        if len(self.signal_history) > self.signal_history_limit:
-                            self.signal_history.pop(0)
-                        
-                        # 신호 연속 유지 시간 체크 (조건 완화: 2분 → 30초)
-                        last_signals = [s[0] for s in self.signal_history[-2:]]  # 2분 → 30초로 완화
-                        if len(last_signals) >= 2 and all(s == technical_signal and s != 0 for s in last_signals):
-                            confirmed = True
-                        else:
-                            confirmed = False
-                        
-                        # 디버깅: 신호 확인 상태 로그
-                        if self.should_log_signal_warning():
-                            logger.info(f"🔍 Signal History: {[s[0] for s in self.signal_history[-3:]]}")
-                            logger.info(f"🔍 Confirmed: {confirmed}, Current Position: {bool(self.current_position)}")
-                            logger.info(f"🔍 News Impact: {self.last_news_impact:.3f} (threshold: {self.news_threshold})")
-                        
-                        # reversal 진입(30초 연속) 체크 (조건 완화)
-                        reversal_confirmed = False
-                        if self.current_position:
-                            current_side = 'LONG' if float(self.current_position.get('positionAmt', 0)) > 0 else 'SHORT'
-                            if (technical_signal == 1 and current_side == 'SHORT') or (technical_signal == -1 and current_side == 'LONG'):
-                                last_rev_signals = [s[0] for s in self.signal_history[-2:]]  # 2분 → 30초로 완화
-                                if len(last_rev_signals) >= 2 and all(s == technical_signal and s != 0 for s in last_rev_signals):
-                                    reversal_confirmed = True
-                        
-                        # 뉴스 임팩트 우선
-                        if abs(self.last_news_impact) > self.news_threshold:
-                            if self.last_news_impact > 0:
-                                logger.info(f"📰 Executing trade based on positive news: {self.last_news_impact:.3f}")
-                                await self.execute_trade(1, kline['close'], "Strong positive news", score=score, adx=adx)
-                            elif self.last_news_impact < 0:
-                                logger.info(f"📰 Executing trade based on negative news: {self.last_news_impact:.3f}")
-                                await self.execute_trade(-1, kline['close'], "Strong negative news", score=score, adx=adx)
-                        else:
-                            # reversal 진입
-                            if self.current_position and reversal_confirmed:
-                                logger.info(f"🔄 Executing reversal trade: {technical_signal} (Market: {market_info['condition']})")
-                                await self.close_position("Technical signal reversal")
-                                await self.execute_trade(technical_signal, kline['close'], f"Technical analysis (reversal) - {market_info['condition']}", reverse=True, score=score, adx=adx)
-                            # 신규 진입
-                            elif not self.current_position and confirmed:
-                                logger.info(f"🚀 Executing new trade: {technical_signal} (Market: {market_info['condition']})")
-                                await self.execute_trade(technical_signal, kline['close'], f"Technical analysis - {market_info['condition']}", score=score, adx=adx)
-                            elif not self.current_position and self.should_log_signal_warning():
-                                # 진입하지 않는 이유 로그
-                                logger.info(f"❌ No trade executed - Signal: {technical_signal}, Confirmed: {confirmed}, Score: {score:.3f}, ADX: {adx:.3f}, Market: {market_info['condition']}")
-                                logger.info(f"📊 Required thresholds - Long: {market_info['threshold_long']}, Short: {market_info['threshold_short']}")
-                        
-                        await self.monitor_position(kline['close'])
-                        await self.update_position()
-                        
-                    except Exception as e:
-                        logger.error(f"Error in handle_kline: {e}")
-                        await self.telegram.send_error(f"Error in handle_kline: {e}")
-
-                # WebSocket 스트리밍 시작
-                await self.binance.stream_klines(handle_kline)
-
-            except Exception as e:
-                logger.error(f"Error in main loop: {e}")
-                await self.telegram.send_error(f"Main loop error: {e}. Restarting in 30 seconds...")
-                
-                # 30초 대기 후 재시작
-                await asyncio.sleep(30)
-                logger.info("Restarting trading bot...")
-                
-                # 리소스 정리
+            
+            while True:
                 try:
-                    await self.cleanup()
-                except:
-                    pass  # 정리 중 에러는 무시
-                
-                # 재초기화를 위해 변수 리셋
-                self.binance = BinanceClient()
-                self.reconnect_attempts = 0
-                
-            except KeyboardInterrupt:
-                logger.info("Received keyboard interrupt, shutting down...")
-                break
-                
-        # 최종 정리
-        await self.cleanup()
+                    # 3. 기존 포지션 처리
+                    if self.current_position:
+                        await self.handle_existing_position()
+                    
+                    # 4. 시장 데이터 업데이트
+                    await self.update_market_data()
+                    
+                    # 5. 시그널 생성
+                    signal, score, adx, market_condition = self.analyzer.generate_signals(self.klines_data)
+                    
+                    # 6. 시장 상태 로깅
+                    logger.info(f"Signal: {signal}, Score: {score}, ADX: {adx}, Market: {market_condition}")
+                    
+                    # 7. 포지션이 없는 경우에만 새로운 진입 고려
+                    if not self.current_position:
+                        # 8. 진입 조건 확인
+                        if signal != 0 and score >= 3:
+                            current_price = self.klines_data['close'].iloc[-1]
+                            await self.execute_trade(signal, current_price, f"Signal: {signal}, Score: {score}")
+                    
+                    # 9. 대기
+                    await asyncio.sleep(1)
+                    
+                except Exception as e:
+                    logger.error(f"Error in main loop: {e}")
+                    await self.telegram.send_error(f"Error in main loop: {e}")
+                    await asyncio.sleep(5)
+                    
+        except Exception as e:
+            logger.error(f"Fatal error: {e}")
+            await self.telegram.send_error(f"Fatal error: {e}")
+        finally:
+            await self.cleanup()
 
     async def cleanup(self):
         """Cleanup resources"""
         await self.binance.close()
         await self.telegram.close()
+
+    def calculate_dynamic_take_profit(self, df, entry_price, side, current_price):
+        """동적 익절 전략 계산"""
+        try:
+            # 1. 추세 강도 분석
+            adx = df['adx'].iloc[-1]
+            trend_strength = "strong" if adx > 30 else "weak"
+            
+            # 2. 모멘텀 분석
+            rsi = df['rsi'].iloc[-1]
+            stoch_k = df['stoch_k'].iloc[-1]
+            momentum = "strong" if (side == 'BUY' and rsi > 60 and stoch_k > 80) or \
+                                 (side == 'SELL' and rsi < 40 and stoch_k < 20) else "weak"
+            
+            # 3. 변동성 분석
+            atr = df['atr'].iloc[-1]
+            volatility = "high" if atr > df['atr'].rolling(20).mean().iloc[-1] * 1.5 else "normal"
+            
+            # 4. 익절가 계산
+            base_tp = entry_price + (atr * 2.5) if side == 'BUY' else entry_price - (atr * 2.5)
+            
+            # 5. 조건별 조정
+            if trend_strength == "strong" and momentum == "strong":
+                # 추세가 강하고 모멘텀도 강할 때
+                if side == 'BUY':
+                    return max(base_tp, current_price * 1.02)  # 최소 2% 추가 상승 기대
+                else:
+                    return min(base_tp, current_price * 0.98)  # 최소 2% 추가 하락 기대
+            elif trend_strength == "weak" or volatility == "high":
+                # 추세가 약하거나 변동성이 높을 때
+                return base_tp  # 기본 익절가 사용
+                
+            return base_tp
+            
+        except Exception as e:
+            logger.error(f"Error in calculate_dynamic_take_profit: {e}")
+            return base_tp
+
+    def detect_trend_reversal(self, df):
+        """추세 전환 감지"""
+        try:
+            # 1. 가격 패턴 분석
+            last_candles = df.tail(3)
+            pattern = self.analyze_price_pattern(last_candles)
+            
+            # 2. 지표 분석
+            rsi = df['rsi'].iloc[-1]
+            macd = df['macd'].iloc[-1]
+            macd_signal = df['macd_signal'].iloc[-1]
+            
+            # 3. 볼륨 분석
+            volume_increase = df['volume'].iloc[-1] > df['volume'].rolling(20).mean().iloc[-1] * 1.5
+            
+            # 4. 전환 신호 생성
+            reversal_signal = 0
+            
+            if pattern == "bearish_reversal" and rsi > 70 and macd < macd_signal and volume_increase:
+                reversal_signal = -1  # 매도 신호
+            elif pattern == "bullish_reversal" and rsi < 30 and macd > macd_signal and volume_increase:
+                reversal_signal = 1  # 매수 신호
+                
+            return reversal_signal
+            
+        except Exception as e:
+            logger.error(f"Error in detect_trend_reversal: {e}")
+            return 0
+
+    def analyze_price_pattern(self, candles):
+        """가격 패턴 분석"""
+        try:
+            if len(candles) < 3:
+                return "unknown"
+                
+            # 마지막 3개 캔들 분석
+            last_3 = candles.tail(3)
+            
+            # 상승 후 하락 패턴
+            if (last_3['close'].iloc[0] < last_3['close'].iloc[1] and 
+                last_3['close'].iloc[1] > last_3['close'].iloc[2] and
+                last_3['volume'].iloc[2] > last_3['volume'].iloc[1]):
+                return "bearish_reversal"
+                
+            # 하락 후 상승 패턴
+            if (last_3['close'].iloc[0] > last_3['close'].iloc[1] and 
+                last_3['close'].iloc[1] < last_3['close'].iloc[2] and
+                last_3['volume'].iloc[2] > last_3['volume'].iloc[1]):
+                return "bullish_reversal"
+                
+            return "unknown"
+            
+        except Exception as e:
+            logger.error(f"Error in analyze_price_pattern: {e}")
+            return "unknown"
+
+    def adjust_position_for_reversal(self, current_position, reversal_signal):
+        """추세 전환 시 포지션 조정"""
+        try:
+            if not current_position:
+                return "hold"
+                
+            # 1. 현재 수익률 계산
+            entry_price = float(current_position['entry'])
+            current_price = self.klines_data['close'].iloc[-1]
+            side = current_position['side']
+            
+            if side == 'BUY':
+                current_pnl = (current_price - entry_price) / entry_price
+            else:
+                current_pnl = (entry_price - current_price) / entry_price
+            
+            # 2. 리스크 평가
+            if current_pnl > 0.02:  # 2% 이상 수익 중
+                if reversal_signal != 0:
+                    # 수익 중이고 전환 신호가 있으면 청산
+                    return "close"
+            elif current_pnl < -0.01:  # 1% 이상 손실 중
+                if reversal_signal != 0:
+                    # 손실 중이고 전환 신호가 있으면 반대 포지션 진입
+                    return "reverse"
+                    
+            return "hold"
+            
+        except Exception as e:
+            logger.error(f"Error in adjust_position_for_reversal: {e}")
+            return "hold"
+
+    async def handle_existing_position(self):
+        """기존 포지션 처리"""
+        try:
+            if not self.current_position:
+                return
+                
+            # 1. 현재 포지션 정보 확인
+            position = await self.binance.get_position()
+            if not position or float(position['positionAmt']) == 0:
+                self.current_position = None
+                return
+                
+            # 2. 추세 전환 감지
+            reversal_signal = self.detect_trend_reversal(self.klines_data)
+            
+            # 3. 포지션 조정 결정
+            action = self.adjust_position_for_reversal(self.current_position, reversal_signal)
+            
+            # 4. 동적 익절가 업데이트
+            current_price = self.klines_data['close'].iloc[-1]
+            new_take_profit = self.calculate_dynamic_take_profit(
+                self.klines_data,
+                float(self.current_position['entry']),
+                self.current_position['side'],
+                current_price
+            )
+            
+            # 5. 포지션 조정 실행
+            if action == "close":
+                await self.close_position("Trend reversal detected")
+            elif action == "reverse":
+                await self.close_position("Trend reversal - reversing position")
+                # 반대 포지션 진입
+                if reversal_signal == 1:
+                    await self.execute_trade(1, current_price, "Trend reversal - long")
+                else:
+                    await self.execute_trade(-1, current_price, "Trend reversal - short")
+            else:  # hold
+                # 익절가만 업데이트
+                self.current_position['take_profit'] = new_take_profit
+                
+        except Exception as e:
+            logger.error(f"Error in handle_existing_position: {e}")
+            await self.telegram.send_error(f"Error in handle_existing_position: {e}")
 
 if __name__ == "__main__":
     bot = TradingBot()
