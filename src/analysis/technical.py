@@ -340,13 +340,31 @@ class TechnicalAnalyzer:
             else:  # 거래량 급증 + 하락
                 signal_score -= 2
                 
-        # 각 지표별 점수 합산
-        signal_score += price_trend
-        signal_score += momentum
-        signal_score += macd_signal
-        signal_score += bb_signal
-        signal_score += supertrend_signal
+        # 각 지표별 점수 합산 (가중치 조정)
+        signal_score += price_trend * 1.5  # 가격 추세 가중치 증가
+        signal_score += momentum * 1.2     # 모멘텀 가중치 증가
+        signal_score += macd_signal * 1.2  # MACD 가중치 증가
+        signal_score += bb_signal * 1.5    # 볼린저 밴드 가중치 증가
+        signal_score += supertrend_signal * 1.3  # Supertrend 가중치 증가
         
+        # ADX 기반 점수 보정 (추세 강도 반영)
+        if adx >= 40:  # 매우 강한 추세
+            if price_trend == 1:  # 상승 추세
+                signal_score += 2
+            elif price_trend == -1:  # 하락 추세
+                signal_score -= 2
+        elif adx >= 30:  # 강한 추세
+            if price_trend == 1:  # 상승 추세
+                signal_score += 1
+            elif price_trend == -1:  # 하락 추세
+                signal_score -= 1
+                
+        # RSI 극단값 보정
+        if df['rsi'].iloc[-1] < 25:  # 극단적 과매도
+            signal_score += 1.5
+        elif df['rsi'].iloc[-1] > 75:  # 극단적 과매수
+            signal_score -= 1.5
+            
         # 시장 상황별 진입 조건 조정
         if market_condition == "crash":
             # 폭락 시: 역추세 매수 기회 포착 (더 관대한 조건)
@@ -383,9 +401,9 @@ class TechnicalAnalyzer:
             # 강한 추세 시 추세 방향 신호 강화
             if adx >= 40:  # 매우 강한 추세
                 if price_trend == 1:
-                    signal_score += 1  # 상승 추세 강화
+                    signal_score += 2  # 상승 추세 강화
                 elif price_trend == -1:
-                    signal_score -= 1  # 하락 추세 강화
+                    signal_score -= 2  # 하락 추세 강화
         else:
             # 일반 시장 조건
             threshold_long = 4
