@@ -18,7 +18,8 @@ import logging
 logger = logging.getLogger(__name__)
 
 class TechnicalAnalyzer:
-    def __init__(self):
+    def __init__(self, symbol=None):
+        self.symbol = symbol
         self.rsi = None
         self.macd = None
         self.ema_short = None
@@ -176,51 +177,101 @@ class TechnicalAnalyzer:
 
     def generate_signals(self, df):
         """Generate trading signals based on technical indicators"""
-        signals = pd.DataFrame(index=df.index)
-        signals['signal'] = 0  # 0: no signal, 1: buy, -1: sell
-
-        # 볼린저밴드 + Stochastic + Supertrend + RSI 조합
-        # 롱: 볼린저 하단 돌파 + Stoch < 20 + Supertrend 매수 + RSI < 35
-        # 숏: 볼린저 상단 돌파 + Stoch > 80 + Supertrend 매도 + RSI > 65
-        last = df.iloc[-1]
-        long_cond = (
-            last['close'] < last['bb_low'] and
-            last['stoch_k'] < 20 and
-            (np.isnan(last['supertrend']) or last['supertrend'] < last['close']) and
-            last['rsi'] < 35
-        )
-        short_cond = (
-            last['close'] > last['bb_high'] and
-            last['stoch_k'] > 80 and
-            (np.isnan(last['supertrend']) or last['supertrend'] > last['close']) and
-            last['rsi'] > 65
-        )
-        if long_cond:
-            signals.iloc[-1, signals.columns.get_loc('signal')] = 1
-        elif short_cond:
-            signals.iloc[-1, signals.columns.get_loc('signal')] = -1
-        # 기존 신호와 결합(majority voting)
-        base_signals = pd.DataFrame(index=df.index)
-        base_signals['signal'] = 0
-        base_signals.loc[df['rsi'] < RSI_OVERSOLD, 'signal'] = 1
-        base_signals.loc[df['rsi'] > RSI_OVERBOUGHT, 'signal'] = -1
-        base_signals.loc[df['macd'] > df['macd_signal'], 'signal'] = 1
-        base_signals.loc[df['macd'] < df['macd_signal'], 'signal'] = -1
-        base_signals.loc[
-            (df['ema_short'] > df['ema_medium']) & (df['ema_medium'] > df['ema_long']), 'signal'] = 1
-        base_signals.loc[
-            (df['ema_short'] < df['ema_medium']) & (df['ema_medium'] < df['ema_long']), 'signal'] = -1
-        signals['base_signal'] = base_signals['signal']
-        signals['final_signal'] = signals[['signal', 'base_signal']].sum(axis=1).apply(
-            lambda x: 1 if x > 0 else (-1 if x < 0 else 0)
-        )
-        return signals
+        try:
+            # 1. 기본 지표 계산
+            df = self.calculate_indicators(df)
+            
+            # 2. 시장 상태 분석
+            adx = df['adx'].iloc[-1]
+            rsi = df['rsi'].iloc[-1]
+            macd = df['macd'].iloc[-1]
+            macd_signal = df['macd_signal'].iloc[-1]
+            stoch_k = df['stoch_k'].iloc[-1]
+            stoch_d = df['stoch_d'].iloc[-1]
+            
+            # 3. 볼륨 분석
+            volume_ma = df['volume'].rolling(20).mean().iloc[-1]
+            current_volume = df['volume'].iloc[-1]
+            volume_ratio = current_volume / volume_ma
+            
+            # 4. 추세 분석
+            ema_short = df['ema_short'].iloc[-1]
+            ema_medium = df['ema_medium'].iloc[-1]
+            ema_long = df['ema_long'].iloc[-1]
+            
+            # 5. 시장 상태 분류
+            market_condition = "normal"
+            if adx > 25:
+                if ema_short > ema_medium > ema_long:
+                    market_condition = "strong_uptrend"
+                elif ema_short < ema_medium < ema_long:
+                    market_condition = "strong_downtrend"
+            elif adx < 20:
+                market_condition = "sideways"
+            
+            # 6. 신호 생성
+            signal = 0
+            score = 0
+            
+            # RSI 기반 신호
+            if rsi < 30:
+                signal += 1
+                score += 1
+            elif rsi > 70:
+                signal -= 1
+                score += 1
+                
+            # MACD 기반 신호
+            if macd > macd_signal:
+                signal += 1
+                score += 1
+            elif macd < macd_signal:
+                signal -= 1
+                score += 1
+                
+            # Stochastic 기반 신호
+            if stoch_k < 20 and stoch_k > stoch_d:
+                signal += 1
+                score += 1
+            elif stoch_k > 80 and stoch_k < stoch_d:
+                signal -= 1
+                score += 1
+                
+            # 볼륨 기반 신호
+            if volume_ratio > 1.5:
+                if df['close'].iloc[-1] > df['open'].iloc[-1]:
+                    signal += 1
+                    score += 1
+                else:
+                    signal -= 1
+                    score += 1
+                    
+            # 추세 기반 신호
+            if market_condition == "strong_uptrend":
+                signal += 1
+                score += 2
+            elif market_condition == "strong_downtrend":
+                signal -= 1
+                score += 2
+                
+            # 최종 신호 결정
+            final_signal = 0
+            if signal > 0 and score >= 3:
+                final_signal = 1
+            elif signal < 0 and score >= 3:
+                final_signal = -1
+                
+            return final_signal, score, adx, market_condition
+            
+        except Exception as e:
+            logger.error(f"Error in generate_signals: {e}")
+            return 0, 0, 0, "error"
 
     def get_latest_signal(self, df):
         """Get the most recent trading signal"""
         df = self.calculate_indicators(df)
         signals = self.generate_signals(df)
-        return signals['final_signal'].iloc[-1]
+        return signals[0]
 
     def calculate_stop_loss_take_profit(self, df, entry_price, side, lookback=10, min_pct=0.3):
         """

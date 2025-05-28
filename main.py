@@ -1,18 +1,24 @@
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 import pandas as pd
 import numpy as np
 import os
 from dotenv import load_dotenv
+from config.settings import (
+    BINANCE_API_KEY, BINANCE_API_SECRET, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
+    TRADING_SYMBOLS, MAX_POSITION_SIZE, MAX_LEVERAGE, POSITION_RATIO, POSITION_SIZE,
+    RSI_PERIOD, RSI_OVERBOUGHT, RSI_OVERSOLD, MACD_FAST, MACD_SLOW, MACD_SIGNAL,
+    STOCH_K, STOCH_D, STOCH_SLOW, EMA_SHORT, EMA_MEDIUM, EMA_LONG, ATR_PERIOD,
+    STOP_LOSS_PERCENTAGE, TAKE_PROFIT_PERCENTAGE, MAX_DAILY_LOSS, MIN_TRADING_INTERVAL,
+    TRADING_ENABLED, TEST_MODE, LOG_LEVEL, LOG_FORMAT, LOG_DATE_FORMAT,
+    SIGNAL_CONFIRMATION_COUNT, SIGNAL_HISTORY_LIMIT, VOLUME_MA_PERIOD, VOLUME_THRESHOLD
+)
 from src.data.binance_client import BinanceClient
 from src.data.news_collector import NewsCollector
 from src.analysis.technical import TechnicalAnalyzer
 from src.utils.telegram_bot import TelegramBot
-from config.settings import (
-    TRADING_SYMBOL, POSITION_SIZE, STOP_LOSS_PERCENTAGE,
-    TAKE_PROFIT_PERCENTAGE, MAX_POSITION_SIZE, MAX_DAILY_LOSS, LEVERAGE
-)
+import time
 
 # Configure logging
 logging.basicConfig(
@@ -22,8 +28,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 class TradingBot:
-    def __init__(self, symbol):
-        self.symbol = symbol
+    def __init__(self, symbol=None):
+        """Initialize the trading bot"""
+        self.symbol = symbol or TRADING_SYMBOLS[0]
         self.binance = BinanceClient(self.symbol)
         self.news_collector = NewsCollector()
         self.technical_analyzer = TechnicalAnalyzer(self.symbol)
@@ -34,7 +41,7 @@ class TradingBot:
         self.last_news_impact = 0
         self.news_threshold = 0.7  # 뉴스 영향도 임계값
         self.last_position_info = None
-        self.last_trade_time = None  # 마지막 거래 시간
+        self.last_trade_time = 0
         self.min_trade_interval = 30  # 최소 거래 간격 (초) - 60초에서 30초로 완화
         self.signal_confirmation_count = 0  # 신호 확인 카운트
         self.required_signal_confirmation = 1  # 필요한 신호 확인 횟수 - 2에서 1로 완화
@@ -58,12 +65,33 @@ class TradingBot:
         # 신호 검증 관련 변수 추가
         self.last_signal_warning_time = None  # 마지막 신호 경고 시간
         self.signal_warning_interval = 60  # 신호 경고 간격 (초)
+        self.daily_loss = 0
+        self.daily_loss_reset_time = time.time()
+        self.position_ratio = POSITION_RATIO / 100  # Convert percentage to decimal
+        self.stop_loss_percentage = STOP_LOSS_PERCENTAGE
+        self.take_profit_percentage = TAKE_PROFIT_PERCENTAGE
+        self.max_daily_loss = MAX_DAILY_LOSS
+        
+        # Initialize logging
+        self.logger = logging.getLogger(__name__)
+        self.logger.setLevel(logging.INFO)
 
     async def initialize(self):
         """Initialize all components"""
         try:
             await self.binance.initialize()
             await self.telegram.initialize()
+            
+            # Send startup notification
+            await self.telegram.send_message(
+                f"🤖 Trading Bot Started\n"
+                f"Symbol: {self.symbol}\n"
+                f"Max Position Size: ${POSITION_SIZE}\n"
+                f"Max Leverage: {MAX_LEVERAGE}x\n"
+                f"Position Ratio: {self.position_ratio * 100}%\n"
+                f"Stop Loss: {self.stop_loss_percentage}%\n"
+                f"Take Profit: {self.take_profit_percentage}%"
+            )
             
             # 초기 과거 데이터 로드 및 전략 수립
             try:
@@ -144,9 +172,9 @@ class TradingBot:
             if self.klines_data[required_cols].isnull().any().any():
                 logger.warning("NaN values detected in price data")
                 # NaN 값을 이전 값으로 채우기
-                self.klines_data[required_cols] = self.klines_data[required_cols].fillna(method='ffill')
+                self.klines_data[required_cols] = self.klines_data[required_cols].ffill()
                 # 여전히 NaN이 있다면 다음 값으로 채우기
-                self.klines_data[required_cols] = self.klines_data[required_cols].fillna(method='bfill')
+                self.klines_data[required_cols] = self.klines_data[required_cols].bfill()
             
             # 가격 데이터 유효성 검증
             for col in ['open', 'high', 'low', 'close']:
@@ -374,36 +402,41 @@ class TradingBot:
             logger.error(f"Error in check_risk_limits: {e}")
             return True
 
-    def calculate_dynamic_position_size(self, signal_strength, volatility, account_balance):
-        """동적 포지션 사이즈 계산 - 신호 강도와 변동성에 따라 조정"""
+    def calculate_position_size(self, current_price):
+        """Calculate position size based on account balance and risk management"""
         try:
-            # 기본 포지션 사이즈 (계좌 잔고의 1-5%)
-            base_size = account_balance * 0.02  # 2% 기본
+            # Get account balance
+            account_info = self.binance.get_account_info()
+            if not account_info:
+                self.logger.error("Failed to get account info")
+                return 0
             
-            # 신호 강도에 따른 조정 (0.5 ~ 1.5배)
-            signal_multiplier = max(0.5, min(1.5, signal_strength))
+            # Get USDT balance
+            usdt_balance = float(account_info['totalWalletBalance'])
             
-            # 변동성에 따른 조정 (높은 변동성일 때 포지션 축소)
-            volatility_multiplier = max(0.3, min(1.0, 1 - volatility))
+            # Calculate position size based on balance and position ratio
+            position_size = usdt_balance * self.position_ratio
             
-            # 최종 포지션 사이즈
-            position_size = base_size * signal_multiplier * volatility_multiplier
+            # Ensure position size doesn't exceed maximum
+            position_size = min(position_size, MAX_POSITION_SIZE)
             
-            # 최대 포지션 사이즈 제한 (계좌 잔고의 10%)
-            max_size = account_balance * 0.1
+            # Calculate quantity based on current price
+            quantity = position_size / current_price
             
-            # 최소 주문 수량 보장 (0.001 BTC)
-            min_size = 0.01 * self.klines_data['close'].iloc[-1]  # BTC 최소 수량을 USD로 변환
+            # Round quantity to appropriate decimal places
+            if self.symbol == 'BTCUSDT':
+                quantity = round(quantity, 3)  # BTC has 3 decimal places
+            elif self.symbol == 'ETHUSDT':
+                quantity = round(quantity, 3)  # ETH has 3 decimal places
+            else:
+                quantity = round(quantity, 2)  # Default to 2 decimal places
             
-            # 최종 사이즈 계산 및 최소/최대 제한 적용
-            final_size = max(min_size, min(position_size, max_size))
-            
-            return final_size
+            self.logger.info(f"Calculated position size: {quantity} {self.symbol} (${position_size})")
+            return quantity
             
         except Exception as e:
-            logger.error(f"Error in calculate_dynamic_position_size: {e}")
-            # 에러 발생 시 최소 주문 수량 반환
-            return 0.01 * self.klines_data['close'].iloc[-1]
+            self.logger.error(f"Error calculating position size: {str(e)}")
+            return 0
 
     def calculate_market_volatility(self):
         """시장 변동성 계산"""
@@ -458,111 +491,85 @@ class TradingBot:
             logger.error(f"Error in calculate_trailing_stop: {e}")
             return entry_price * 0.995 if side == 'BUY' else entry_price * 1.005
 
-    async def execute_trade(self, signal, price, reason="", reverse=False, score=None, adx=None):
-        """Execute trade based on signal and set dynamic stop loss/take profit"""
+    async def execute_trade(self, signal, score, market_condition):
+        """Execute trade based on signal and market conditions"""
         try:
-            if not await self.check_risk_limits():
-                logger.warning("🚫 Trade blocked by risk limits")
-                return
-            current_time = datetime.now()
-            if self.last_trade_time and (current_time - self.last_trade_time).total_seconds() < self.min_trade_interval:
-                remaining_time = self.min_trade_interval - (current_time - self.last_trade_time).total_seconds()
-                logger.info(f'⏰ Trade blocked by min_trade_interval. Remaining: {remaining_time:.0f}s')
-                return
-
-            # 계좌 정보 업데이트
-            await self.update_account_info()
+            # Get current price
+            current_price = float(self.klines_data['close'].iloc[-1])
             
-            # 시장 변동성 계산
-            volatility = self.calculate_market_volatility()
+            # Calculate position size
+            quantity = self.calculate_position_size(current_price)
+            if quantity <= 0:
+                self.logger.warning("Invalid position size calculated")
+                return False
             
-            # 동적 포지션 사이즈 계산 (BTC 단위로 변환)
-            dynamic_position_size = self.calculate_dynamic_position_size(score or 0.5, volatility, self.account_balance)
-            dynamic_position_size = dynamic_position_size / price  # USD를 BTC로 변환
+            # Set leverage
+            if not self.binance.set_leverage(MAX_LEVERAGE):
+                self.logger.error("Failed to set leverage")
+                return False
             
-            # 최소 주문 수량 보장 및 정밀도 조정
-            dynamic_position_size = max(0.01, round(dynamic_position_size, 3))  # 최소 0.001 BTC, 3자리까지 반올림
+            # Calculate stop loss and take profit prices
+            stop_loss_price, take_profit_price = self.calculate_stop_loss_take_profit(
+                current_price, signal
+            )
             
-            # 신호/점수/ADX 로그
-            log_msg = f"Signal: {signal}, Score: {score}, ADX: {adx}, Volatility: {volatility:.4f}, Position Size: {dynamic_position_size:.3f} BTC, Reason: {reason}"
-            logger.info(log_msg)
-            await self.telegram.send_message(f"[{self.symbol}] {log_msg}")
-
-            # Dynamic leverage adjustment based on market conditions
-            leverage = self.calculate_dynamic_leverage(score, adx)
-            await self.binance.set_leverage(leverage)
-
-            # 신호 확인 로직 (조건 완화)
-            if not reverse:  # 리버스가 아닌 경우에만 신호 확인
-                if signal != self.last_signal:
-                    self.signal_confirmation_count = 1
-                    self.last_signal = signal
-                    logger.info(f"🔄 Signal changed to {signal}, confirmation count reset to 1")
-                else:
-                    self.signal_confirmation_count += 1
-                    logger.info(f"🔄 Signal {signal} confirmed {self.signal_confirmation_count} times")
-
-                # 조건 완화: 2회 → 1회 확인으로 변경
-                if self.signal_confirmation_count < 1:  # required_signal_confirmation을 1로 완화
-                    logger.info(f"⏳ Waiting for signal confirmation: {self.signal_confirmation_count}/1")
-                    return
-
-            if signal == 1 and (not self.current_position or reverse):  # Buy signal
-                stop_loss, take_profit = self.technical_analyzer.calculate_stop_loss_take_profit(
-                    self.klines_data, price, 'BUY')
-                await self.binance.place_order('BUY', dynamic_position_size)
+            # Place order
+            order = self.binance.place_order(
+                side=signal,
+                quantity=quantity,
+                stop_loss=stop_loss_price,
+                take_profit=take_profit_price
+            )
+            
+            if order:
+                # Update position info
                 self.current_position = {
-                    'side': 'BUY', 
-                    'entry': price, 
-                    'stop_loss': stop_loss, 
-                    'take_profit': take_profit,
-                    'trailing_stop': stop_loss,
-                    'size': dynamic_position_size
+                    'side': signal,
+                    'entry_price': current_price,
+                    'quantity': quantity,
+                    'stop_loss': stop_loss_price,
+                    'take_profit': take_profit_price,
+                    'size': quantity * current_price
                 }
-                self.last_trade_time = current_time
-                self.signal_confirmation_count = 0
-                self.total_trades += 1
-                await self.telegram.send_trade_signal(
-                    'BUY', self.symbol, price, f"Signal: {reason}\nSL: {stop_loss:.2f}, TP: {take_profit:.2f}\nSize: {dynamic_position_size:.3f} {self.symbol.split('USDT')[0]}"
+                
+                # Send notification
+                self.telegram.send_message(
+                    f"🔄 Trade Executed\n"
+                    f"Symbol: {self.symbol}\n"
+                    f"Side: {signal}\n"
+                    f"Entry Price: ${current_price:.2f}\n"
+                    f"Quantity: {quantity}\n"
+                    f"Position Size: ${quantity * current_price:.2f}\n"
+                    f"Leverage: {MAX_LEVERAGE}x\n"
+                    f"Stop Loss: ${stop_loss_price:.2f}\n"
+                    f"Take Profit: ${take_profit_price:.2f}\n"
+                    f"Market Condition: {market_condition}"
                 )
-            elif signal == -1 and (not self.current_position or reverse):  # Sell signal
-                stop_loss, take_profit = self.technical_analyzer.calculate_stop_loss_take_profit(
-                    self.klines_data, price, 'SELL')
-                await self.binance.place_order('SELL', dynamic_position_size)
-                self.current_position = {
-                    'side': 'SELL', 
-                    'entry': price, 
-                    'stop_loss': stop_loss, 
-                    'take_profit': take_profit,
-                    'trailing_stop': stop_loss,
-                    'size': dynamic_position_size
-                }
-                self.last_trade_time = current_time
-                self.signal_confirmation_count = 0
-                self.total_trades += 1
-                await self.telegram.send_trade_signal(
-                    'SELL', self.symbol, price, f"Signal: {reason}\nSL: {stop_loss:.2f}, TP: {take_profit:.2f}\nSize: {dynamic_position_size:.3f} {self.symbol.split('USDT')[0]}"
-                )
-
-            await self.update_position()
+                
+                self.logger.info(f"Trade executed successfully: {signal} {quantity} {self.symbol}")
+                return True
+            else:
+                self.logger.error("Failed to place order")
+                return False
+                
         except Exception as e:
-            logger.error(f"Error in execute_trade: {e}")
-            await self.telegram.send_error(f"Error in execute_trade: {e}")
+            self.logger.error(f"Error executing trade: {str(e)}")
+            return False
 
     def calculate_dynamic_leverage(self, score, adx):
         """Calculate dynamic leverage based on market conditions"""
         try:
             # Example logic: Adjust leverage based on ADX and score
             if adx > 25 and score > 0.8:
-                return min(50, LEVERAGE * 1.5)  # Increase leverage in strong trends, max 50x
+                return min(50, MAX_LEVERAGE * 1.5)  # Increase leverage in strong trends, max 50x
             elif adx < 20 or score < 0.5:
-                return max(5, LEVERAGE * 0.5)  # Decrease leverage in weak trends
-            return min(50, LEVERAGE)  # Default leverage, max 50x
+                return max(5, MAX_LEVERAGE * 0.5)  # Decrease leverage in weak trends
+            return min(50, MAX_LEVERAGE)  # Default leverage, max 50x
         except Exception as e:
             logger.error(f"Error in calculate_dynamic_leverage: {e}")
-            return min(50, LEVERAGE)  # Fallback to default leverage, max 50x
+            return min(50, MAX_LEVERAGE)  # Fallback to default leverage, max 50x
 
-    def calculate_stop_loss_take_profit(self, df, entry_price, side, leverage=LEVERAGE, lookback=10, min_pct=0.3):
+    def calculate_stop_loss_take_profit(self, df, entry_price, side, leverage=MAX_LEVERAGE, lookback=10, min_pct=0.3):
         """
         Calculate dynamic stop loss and take profit based on recent price action.
         Enforce a minimum distance (min_pct, now 0.3%) from entry price for 30x leverage.
@@ -611,6 +618,8 @@ class TradingBot:
             if position and float(position['positionAmt']) != 0:
                 side = 'BUY' if float(position['positionAmt']) > 0 else 'SELL'
                 position['side'] = side
+                position['size'] = abs(float(position['positionAmt']))  # 포지션 크기 추가
+                
                 if self.current_position:
                     if 'stop_loss' in self.current_position:
                         position['stop_loss'] = self.current_position['stop_loss']
@@ -636,6 +645,9 @@ class TradingBot:
                     await self.telegram.send_position_update({**position, 'symbol': self.symbol})
                     self.last_position_info = pos_info
                 self.current_position = position
+            else:
+                self.current_position = None
+                self.last_position_info = None
         except Exception as e:
             logger.error(f"Error in update_position: {e}")
             await self.telegram.send_error(f"Error in update_position: {e}")
@@ -876,83 +888,102 @@ class TradingBot:
         """Update market data and indicators"""
         try:
             # Get latest kline data
-            klines = await self.binance.get_klines(limit=100)
-            if not klines:
-                return
+            klines = await self.binance.get_historical_klines(interval='1m', limit=100)
+            if not klines.empty:
+                # Update klines data
+                self.klines_data = klines
                 
-            # Update klines data
-            self.klines_data = pd.DataFrame(klines)
-            
-            # Calculate indicators
-            self.klines_data = self.technical_analyzer.calculate_indicators(self.klines_data)
-            
-            # Validate data integrity
-            if not self.validate_data_integrity():
-                logger.warning(f"[{self.symbol}] Data integrity check failed after market data update")
-                return
+                # Calculate indicators
+                self.klines_data = self.technical_analyzer.calculate_indicators(self.klines_data)
+                
+                # Validate data integrity
+                if not self.validate_data_integrity():
+                    logger.warning(f"[{self.symbol}] Data integrity check failed after market data update")
+                    return False
+                    
+                return True
                 
         except Exception as e:
             logger.error(f"Error in update_market_data: {e}")
             await self.telegram.send_error(f"Error in update_market_data: {e}")
+            return False
 
     async def run(self):
         """메인 실행 함수"""
         try:
             logger.info(f"[{self.symbol}] Starting trading bot...")
-            await self.telegram.send_message(f"[{self.symbol}] 🤖 트레이딩 봇 시작")
+            await self.telegram.send_message(f"[{self.symbol}] 🤖 트레이딩 봇 시작 (격리 마진 모드)")
             
             # 1. 초기 설정
             await self.setup()
             
-            # 2. 기존 포지션 확인 및 처리
-            position = await self.binance.get_position()
-            if position and float(position['positionAmt']) != 0:
-                logger.info(f"[{self.symbol}] Found existing position, initializing...")
+            # 2. 기존 포지션 확인 및 분석
+            current_price = 0
+            if len(self.klines_data) > 0:
+                current_price = self.klines_data['close'].iloc[-1]
+                
+            position, analysis = await self.binance.get_position_with_analysis(current_price)
+            if position and abs(float(position.get('positionAmt', 0))) > 0:
+                logger.info(f"[{self.symbol}] Found existing position, analyzing...")
+                
+                # 기존 포지션 정보를 current_position에 설정
                 self.current_position = {
-                    'side': 'BUY' if float(position['positionAmt']) > 0 else 'SELL',
-                    'entry': position['entryPrice'],
-                    'size': abs(float(position['positionAmt'])),
-                    'take_profit': None,  # 동적 익절가로 업데이트될 예정
-                    'stop_loss': position['stopLoss']
+                    'side': 'BUY' if float(position.get('positionAmt', 0)) > 0 else 'SELL',
+                    'entry': float(position.get('entryPrice', 0)),
+                    'size': abs(float(position.get('positionAmt', 0))),
+                    'leverage': int(position.get('leverage', 1))
                 }
-                # 기존 포지션 발견 시 한 번만 알림
-                await self.telegram.send_message(
-                    f"[{self.symbol}] 🔄 기존 포지션 발견\n"
-                    f"방향: {self.current_position['side']}\n"
-                    f"진입가: {self.current_position['entry']}\n"
-                    f"수량: {self.current_position['size']} BTC"
-                )
+                
+                if analysis:
+                    action = analysis.get('action', 'maintain')
+                    reason = analysis.get('reason', '')
+                    pnl = analysis.get('pnl_percentage', 0)
+                    
+                    await self.telegram.send_message(
+                        f"[{self.symbol}] 🔍 기존 포지션 분석 완료\n"
+                        f"포지션: {self.current_position['side']}\n"
+                        f"진입가: {self.current_position['entry']:.2f}\n"
+                        f"레버리지: {self.current_position['leverage']}x\n"
+                        f"현재 수익률: {pnl:.2f}%\n"
+                        f"분석 결과: {action}\n"
+                        f"사유: {reason}"
+                    )
+                    
+                    # 분석 결과에 따른 초기 액션
+                    if action == 'close':
+                        await self.close_position(f"Initial analysis: {reason}")
             
             while True:
                 try:
-                    # 3. 기존 포지션 처리
+                    # 3. 기존 포지션 처리 (분석 기반)
                     if self.current_position:
                         await self.handle_existing_position()
                     
                     # 4. 시장 데이터 업데이트
-                    await self.update_market_data()
+                    if not await self.update_market_data():
+                        await asyncio.sleep(5)
+                        continue
                     
-                    # 5. 시그널 생성
-                    signal, score, adx, market_condition = self.technical_analyzer.generate_signals(self.klines_data)
-                    
-                    # 6. 시장 상태 로깅 (로그로만 기록)
-                    logger.info(f"[{self.symbol}] Signal: {signal}, Score: {score}, ADX: {adx}, Market: {market_condition}")
-                    
-                    # 7. 포지션이 없는 경우에만 새로운 진입 고려
+                    # 5. 포지션이 없는 경우에만 새로운 진입 고려
                     if not self.current_position:
-                        # 8. 진입 조건 확인
+                        # 동적 레버리지 업데이트 (포지션이 없을 때만)
+                        new_leverage = await self.binance.update_leverage_if_needed()
+                        if new_leverage:
+                            logger.info(f"[{self.symbol}] Leverage updated to {new_leverage}x")
+                        
+                        # 시그널 생성
+                        signal, score, adx, market_condition = self.technical_analyzer.generate_signals(self.klines_data)
+                        
+                        # 진입 조건 확인
                         if signal != 0 and score >= 3:
                             current_price = self.klines_data['close'].iloc[-1]
-                            await self.execute_trade(signal, current_price, f"Signal: {signal}, Score: {score}")
+                            await self.execute_trade(signal, score, market_condition)
                     
-                    # 9. 대기
+                    # 6. 대기
                     await asyncio.sleep(1)
                     
                 except Exception as e:
                     logger.error(f"Error in main loop: {e}")
-                    # 실제 에러 발생 시에만 텔레그램으로 전송
-                    if "position" in str(e).lower() or "order" in str(e).lower():
-                        await self.telegram.send_error(f"[{self.symbol}] ⚠️ 메인 루프 에러: {e}")
                     await asyncio.sleep(5)
                     
         except Exception as e:
@@ -1143,49 +1174,133 @@ class TradingBot:
             return "hold"
 
     async def handle_existing_position(self):
-        """기존 포지션 처리"""
+        """기존 포지션 처리 - 분석 후 유지/청산 결정"""
         try:
             if not self.current_position:
                 return
                 
-            # 1. 현재 포지션 정보 확인
-            position = await self.binance.get_position()
-            if not position or float(position['positionAmt']) == 0:
+            # 현재 가격과 기술적 지표 데이터 준비
+            current_price = self.klines_data['close'].iloc[-1]
+            technical_data = {
+                'rsi': self.klines_data['rsi'].iloc[-1] if 'rsi' in self.klines_data.columns else 50,
+                'ema_short': self.klines_data['ema_short'].iloc[-1] if 'ema_short' in self.klines_data.columns else current_price,
+                'ema_long': self.klines_data['ema_long'].iloc[-1] if 'ema_long' in self.klines_data.columns else current_price,
+                'macd': self.klines_data['macd'].iloc[-1] if 'macd' in self.klines_data.columns else 0,
+                'adx': self.klines_data['adx'].iloc[-1] if 'adx' in self.klines_data.columns else 25
+            }
+            
+            # Binance에서 실제 포지션 정보와 분석 결과 가져오기
+            position, analysis = await self.binance.get_position_with_analysis(current_price, technical_data)
+            
+            if not position or not analysis:
                 self.current_position = None
                 return
                 
-            # 2. 추세 전환 감지
-            reversal_signal = self.detect_trend_reversal(self.klines_data)
+            # 분석 결과에 따른 액션 수행
+            action = analysis.get('action', 'maintain')
+            reason = analysis.get('reason', 'No reason provided')
+            pnl_percentage = analysis.get('pnl_percentage', 0)
             
-            # 3. 포지션 조정 결정
-            action = self.adjust_position_for_reversal(self.current_position, reversal_signal)
+            logger.info(f"[{self.symbol}] Position analysis: {action} - {reason}")
             
-            # 4. 동적 익절가 업데이트
-            current_price = self.klines_data['close'].iloc[-1]
-            new_take_profit = self.calculate_dynamic_take_profit(
-                self.klines_data,
-                float(self.current_position['entry']),
-                self.current_position['side'],
-                current_price
-            )
-            
-            # 5. 포지션 조정 실행
-            if action == "close":
-                await self.close_position("Trend reversal detected")
-            elif action == "reverse":
-                await self.close_position("Trend reversal - reversing position")
-                # 반대 포지션 진입
-                if reversal_signal == 1:
-                    await self.execute_trade(1, current_price, "Trend reversal - long")
-                else:
-                    await self.execute_trade(-1, current_price, "Trend reversal - short")
-            else:  # hold
-                # 익절가만 업데이트
-                self.current_position['take_profit'] = new_take_profit
+            if action == 'close':
+                await self.close_position(f"Position analysis: {reason}")
+                await self.telegram.send_message(
+                    f"[{self.symbol}] 🔄 포지션 청산\n"
+                    f"사유: {reason}\n"
+                    f"수익률: {pnl_percentage:.2f}%"
+                )
+                
+            elif action == 'partial_close':
+                # 일부 익절 (50% 청산)
+                try:
+                    position_amt = abs(float(position.get('positionAmt', 0)))
+                    close_amount = position_amt * 0.5  # 50% 청산
+                    
+                    side = 'SELL' if float(position.get('positionAmt', 0)) > 0 else 'BUY'
+                    await self.binance.place_order(side, close_amount, order_type='MARKET', reduce_only=True)
+                    
+                    await self.telegram.send_message(
+                        f"[{self.symbol}] 📈 일부 익절 (50%)\n"
+                        f"사유: {reason}\n"
+                        f"수익률: {pnl_percentage:.2f}%"
+                    )
+                    
+                    # 포지션 정보 업데이트
+                    await self.update_position()
+                    
+                except Exception as e:
+                    logger.error(f"Error in partial close: {e}")
+                    
+            elif action == 'maintain':
+                # 포지션 유지 - 동적 익절가/손절가 업데이트
+                await self.update_dynamic_stop_take_profit(position, current_price, technical_data)
+                
+            # 뉴스 영향도 확인
+            if abs(self.last_news_impact) > self.news_threshold:
+                await self.handle_news_based_position_adjustment(position, analysis)
                 
         except Exception as e:
             logger.error(f"Error in handle_existing_position: {e}")
             await self.telegram.send_error(f"Error in handle_existing_position: {e}")
+
+    async def update_dynamic_stop_take_profit(self, position, current_price, technical_data):
+        """동적 손절가/익절가 업데이트"""
+        try:
+            entry_price = float(position.get('entryPrice', 0))
+            side = 'LONG' if float(position.get('positionAmt', 0)) > 0 else 'SHORT'
+            
+            # ATR 기반 동적 손절가/익절가 계산
+            atr = technical_data.get('atr', current_price * 0.02)  # 기본값 2%
+            
+            if side == 'LONG':
+                # 롱 포지션
+                dynamic_stop_loss = current_price - (atr * 2)  # ATR의 2배
+                dynamic_take_profit = current_price + (atr * 3)  # ATR의 3배
+                
+                # 기존 손절가보다 유리한 경우에만 업데이트
+                if 'stop_loss' in self.current_position:
+                    current_stop = self.current_position['stop_loss']
+                    if dynamic_stop_loss > current_stop:
+                        self.current_position['stop_loss'] = dynamic_stop_loss
+                        logger.info(f"[{self.symbol}] Updated stop loss: {dynamic_stop_loss:.2f}")
+                        
+            else:
+                # 숏 포지션
+                dynamic_stop_loss = current_price + (atr * 2)  # ATR의 2배
+                dynamic_take_profit = current_price - (atr * 3)  # ATR의 3배
+                
+                # 기존 손절가보다 유리한 경우에만 업데이트
+                if 'stop_loss' in self.current_position:
+                    current_stop = self.current_position['stop_loss']
+                    if dynamic_stop_loss < current_stop:
+                        self.current_position['stop_loss'] = dynamic_stop_loss
+                        logger.info(f"[{self.symbol}] Updated stop loss: {dynamic_stop_loss:.2f}")
+            
+            # 익절가는 항상 업데이트
+            self.current_position['take_profit'] = dynamic_take_profit
+            
+        except Exception as e:
+            logger.error(f"Error updating dynamic stop/take profit: {e}")
+
+    async def handle_news_based_position_adjustment(self, position, analysis):
+        """뉴스 기반 포지션 조정"""
+        try:
+            side = 'LONG' if float(position.get('positionAmt', 0)) > 0 else 'SHORT'
+            news_impact = self.last_news_impact
+            
+            # 뉴스 영향도와 포지션 방향이 반대인 경우
+            if (side == 'LONG' and news_impact < -0.7) or (side == 'SHORT' and news_impact > 0.7):
+                await self.close_position(f"Strong negative news impact: {news_impact:.2f}")
+                await self.telegram.send_message(
+                    f"[{self.symbol}] 📰 뉴스 기반 포지션 청산\n"
+                    f"포지션: {side}\n"
+                    f"뉴스 영향도: {news_impact:.2f}\n"
+                    f"사유: 강한 반대 뉴스 영향"
+                )
+                
+        except Exception as e:
+            logger.error(f"Error in news-based position adjustment: {e}")
 
 if __name__ == "__main__":
     import asyncio
