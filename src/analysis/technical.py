@@ -419,10 +419,9 @@ class TechnicalAnalyzer:
         signals = self.generate_signals(df)
         return signals[0]
 
-    def calculate_stop_loss_take_profit(self, df, entry_price, side, lookback=10, min_pct=0.3):
+    def calculate_stop_loss_take_profit(self, df, entry_price, side, lookback=10, min_pct=0.3, market_condition="normal"):
         """
-        Calculate dynamic stop loss and take profit based on recent price action.
-        Enforce a minimum distance (min_pct, now 0.3%) from entry price for 30x leverage.
+        시장 상황에 맞는 동적 손절/익절 계산
         """
         if len(df) < lookback:
             lookback = len(df)
@@ -430,12 +429,53 @@ class TechnicalAnalyzer:
             atr = entry_price * 0.005  # fallback
         else:
             atr = df['atr'].tail(lookback).mean()
-        if side == 'BUY':
-            stop_loss = entry_price - atr * 1.5
-            take_profit = entry_price + atr * 2.5
-        else:
-            stop_loss = entry_price + atr * 1.5
-            take_profit = entry_price - atr * 2.5
+            
+        # 시장 상황별 손절/익절 전략
+        if market_condition == "crash":  # 폭락장 - 역추세 매수
+            # 빠른 익절, 넓은 손절 (반등 기대)
+            if side == 'BUY':
+                stop_loss = entry_price - atr * 3.0  # 넓은 손절
+                take_profit = entry_price + atr * 1.5  # 빠른 익절
+            else:
+                stop_loss = entry_price + atr * 1.5
+                take_profit = entry_price - atr * 3.0
+                
+        elif market_condition == "pump":  # 폭등장 - 역추세 매도
+            # 빠른 익절, 넓은 손절 (하락 기대)
+            if side == 'BUY':
+                stop_loss = entry_price - atr * 1.5
+                take_profit = entry_price + atr * 3.0
+            else:
+                stop_loss = entry_price + atr * 3.0  # 넓은 손절
+                take_profit = entry_price - atr * 1.5  # 빠른 익절
+                
+        elif market_condition == "sideways":  # 횡보장 - 볼린저 밴드 전략
+            # 좁은 손절/익절 (빠른 회전)
+            if side == 'BUY':
+                stop_loss = entry_price - atr * 1.0
+                take_profit = entry_price + atr * 1.5
+            else:
+                stop_loss = entry_price + atr * 1.0
+                take_profit = entry_price - atr * 1.5
+                
+        elif market_condition == "strong_trend":  # 강한 추세장 - 추세 추종
+            # 넓은 손절, 큰 익절 (추세 지속 기대)
+            if side == 'BUY':
+                stop_loss = entry_price - atr * 2.0
+                take_profit = entry_price + atr * 4.0
+            else:
+                stop_loss = entry_price + atr * 2.0
+                take_profit = entry_price - atr * 4.0
+                
+        else:  # 일반 시장
+            # 기본 전략
+            if side == 'BUY':
+                stop_loss = entry_price - atr * 1.5
+                take_profit = entry_price + atr * 2.5
+            else:
+                stop_loss = entry_price + atr * 1.5
+                take_profit = entry_price - atr * 2.5
+        
         # 최소폭 강제 (0.3%)
         min_dist = entry_price * min_pct / 100
         if side == 'BUY':
@@ -444,6 +484,7 @@ class TechnicalAnalyzer:
         else:
             stop_loss = max(stop_loss, entry_price + min_dist)
             take_profit = min(take_profit, entry_price - min_dist * 2)
+            
         return stop_loss, take_profit
 
     def generate_comprehensive_signal(self, df, return_details=False):
@@ -508,23 +549,24 @@ class TechnicalAnalyzer:
         adx = df['adx'].iloc[-1]
         
         # 9. 급격한 가격 변동 감지 (폭락/폭등)
+        price_change_1m = (df['close'].iloc[-1] - df['close'].iloc[-2]) / df['close'].iloc[-2] * 100 if len(df) >= 2 else 0
         price_change_5m = (df['close'].iloc[-1] - df['close'].iloc[-6]) / df['close'].iloc[-6] * 100 if len(df) >= 6 else 0
         price_change_15m = (df['close'].iloc[-1] - df['close'].iloc[-16]) / df['close'].iloc[-16] * 100 if len(df) >= 16 else 0
         
-        # 시장 상황 분류
+        # 시장 상황 분석 및 분류
         market_condition = "normal"
         
-        # 폭락/폭등 조건 (5분간 2% 이상 또는 15분간 4% 이상 변동)
-        if abs(price_change_5m) >= 2.0 or abs(price_change_15m) >= 4.0:
-            if price_change_5m > 0 or price_change_15m > 0:
+        # 폭락/폭등 조건 (1분간 1% 이상 또는 5분간 3% 이상 변동)
+        if abs(price_change_1m) >= 1.0 or abs(price_change_5m) >= 3.0:
+            if price_change_1m > 0 or price_change_5m > 0:
                 market_condition = "pump"  # 폭등
             else:
                 market_condition = "crash"  # 폭락
-        # 횡보장 조건 (ADX < 20 AND 변동성 낮음)
-        elif adx < 20 and not is_high_volatility:
+        # 횡보장 조건 (ADX < 25 AND 변동성 낮음)
+        elif adx < 25 and atr < 0.02:
             market_condition = "sideways"  # 횡보
         # 강한 추세 조건
-        elif adx >= 30:
+        elif adx >= 40:
             market_condition = "strong_trend"  # 강한 추세
         
         # 종합 신호 생성
@@ -617,6 +659,7 @@ class TechnicalAnalyzer:
         # 로깅용 추가 정보
         market_info = {
             'condition': market_condition,
+            'price_change_1m': price_change_1m,
             'price_change_5m': price_change_5m,
             'price_change_15m': price_change_15m,
             'threshold_long': threshold_long,
@@ -657,11 +700,11 @@ class TechnicalAnalyzer:
             atr = current['atr']
             atr_ratio = atr / current['close'] if current['close'] > 0 else 0
             
-            # Generate signal based on indicators (더 엄격한 조건)
+            # Generate signal based on indicators (추세 추종 강화)
             signal_count = 0
             total_score = 0
             
-            # RSI signals (더 극단적인 값에서만 신호 생성)
+            # RSI signals (하락장에서 더 민감하게)
             if current['rsi'] < 25:  # 극도 과매도
                 signal_count += 1
                 total_score += 0.4
@@ -674,6 +717,10 @@ class TechnicalAnalyzer:
             elif current['rsi'] > 65:  # 과매수
                 signal_count -= 0.5
                 total_score += 0.2
+            # 하락 추세에서 RSI 중간값도 매도 신호로 활용
+            elif trend == 'bearish' and current['rsi'] > 50:
+                signal_count -= 0.3
+                total_score += 0.15
             
             # MACD signals (크로스오버와 히스토그램 모두 확인)
             macd_diff = current['macd'] - current['macd_signal']
@@ -693,13 +740,13 @@ class TechnicalAnalyzer:
                     signal_count -= 0.3
                     total_score += 0.1
             
-            # EMA signals (3개 EMA 모두 확인)
+            # EMA signals (3개 EMA 모두 확인) - 추세 추종 강화
             if current['ema_short'] > current['ema_medium'] > current['ema_long']:
                 signal_count += 1
                 total_score += 0.3
             elif current['ema_short'] < current['ema_medium'] < current['ema_long']:
                 signal_count -= 1
-                total_score += 0.3
+                total_score += 0.3  # 하락 추세 신호 강화
             elif current['ema_short'] > current['ema_medium']:
                 signal_count += 0.5
                 total_score += 0.15
@@ -721,6 +768,14 @@ class TechnicalAnalyzer:
                 signal_count -= 0.5
                 total_score += 0.15
             
+            # 강한 추세에서 추가 신호 강화
+            if trend == 'bearish' and adx > 50:  # 강한 하락 추세
+                signal_count -= 0.8  # 추가 매도 신호
+                total_score += 0.3
+            elif trend == 'bullish' and adx > 50:  # 강한 상승 추세
+                signal_count += 0.8  # 추가 매수 신호
+                total_score += 0.3
+            
             # ADX 확인 (추세 강도)
             adx = current.get('adx', 25)
             if adx < 20:  # 약한 추세 - 신호 무효화
@@ -741,22 +796,158 @@ class TechnicalAnalyzer:
             elif volume_ratio < 0.7:  # 낮은 거래량 - 신호 약화
                 total_score *= 0.7
             
-            # Volatility adjustment (변동성 조정)
-            if atr_ratio > 0.03:  # 높은 변동성 - 더 보수적
-                total_score *= 0.6
+            # Volatility adjustment (변동성 조정) - 추세장에서는 덜 보수적
+            if atr_ratio > 0.03:  # 높은 변동성
+                if adx > 40:  # 강한 추세에서는 변동성 페널티 완화
+                    total_score *= 0.8
+                else:
+                    total_score *= 0.6
             elif atr_ratio > 0.02:  # 보통 변동성
-                total_score *= 0.8
+                total_score *= 0.9
             
-            # 최종 신호 결정 (더 엄격한 조건)
-            if signal_count >= 2.0 and total_score >= 0.6:  # 강한 매수 신호
-                signal = 1
-            elif signal_count <= -2.0 and total_score >= 0.6:  # 강한 매도 신호
-                signal = -1
-            else:
-                signal = 0  # 신호 없음
+            # 최종 신호 결정 (추세 + 지표 확인 방식)
+            logger.info(f"🔍 Technical Analysis Debug:")
+            logger.info(f"   Signal Count: {signal_count:.2f}")
+            logger.info(f"   Total Score: {total_score:.3f}")
+            logger.info(f"   ADX: {adx:.2f}, Trend: {trend}")
+            logger.info(f"   RSI: {current['rsi']:.2f}")
+            logger.info(f"   MACD: {current['macd']:.2f} vs Signal: {current['macd_signal']:.2f}")
+            logger.info(f"   EMA: Short({current['ema_short']:.2f}) vs Medium({current['ema_medium']:.2f})")
+            logger.info(f"   Volume Ratio: {volume_ratio:.2f}")
+            
+            # 강한 추세에서는 조건 완화 (하지만 지표 확인은 필수)
+            if adx > 50:  # 매우 강한 추세
+                if trend == 'bearish' and signal_count <= -0.8 and total_score >= 0.3:
+                    signal = -1  # 하락 추세 + 최소 지표 확인
+                    logger.info(f"   ✅ STRONG BEARISH TREND SELL! (ADX: {adx:.2f})")
+                elif trend == 'bullish' and signal_count >= 0.8 and total_score >= 0.3:
+                    signal = 1   # 상승 추세 + 최소 지표 확인
+                    logger.info(f"   ✅ STRONG BULLISH TREND BUY! (ADX: {adx:.2f})")
+                elif signal_count >= 1.2 and total_score >= 0.4:  # 강한 추세에서 조건 완화
+                    signal = 1
+                    logger.info(f"   ✅ BUY Signal (Strong Trend)!")
+                elif signal_count <= -1.2 and total_score >= 0.4:  # 강한 추세에서 조건 완화
+                    signal = -1
+                    logger.info(f"   ✅ SELL Signal (Strong Trend)!")
+                else:
+                    signal = 0
+                    logger.info(f"   ❌ No Signal in Strong Trend: Count({signal_count:.2f}) Score({total_score:.3f})")
+            else:  # 일반적인 시장 조건
+                if signal_count >= 1.5 and total_score >= 0.5:  # 매수 신호
+                    signal = 1
+                    logger.info(f"   ✅ BUY Signal Generated!")
+                elif signal_count <= -1.5 and total_score >= 0.5:  # 매도 신호
+                    signal = -1
+                    logger.info(f"   ✅ SELL Signal Generated!")
+                else:
+                    signal = 0  # 신호 없음
+                    logger.info(f"   ❌ No Signal: Count({signal_count:.2f}) Score({total_score:.3f})")
             
             # 최종 점수 정규화
             score = min(total_score, 1.0)
+            
+            # 시장 상황 분석 및 분류
+            price_change_1m = (current['close'] - df['close'].iloc[-2]) / df['close'].iloc[-2] * 100 if len(df) >= 2 else 0
+            price_change_5m = (current['close'] - df['close'].iloc[-6]) / df['close'].iloc[-6] * 100 if len(df) >= 6 else 0
+            price_change_15m = (current['close'] - df['close'].iloc[-16]) / df['close'].iloc[-16] * 100 if len(df) >= 16 else 0
+            
+            # 시장 상황 분류
+            market_condition = "normal"
+            
+            # 폭락/폭등 조건 (1분간 1% 이상 또는 5분간 3% 이상 변동)
+            if abs(price_change_1m) >= 1.0 or abs(price_change_5m) >= 3.0:
+                if price_change_1m > 0 or price_change_5m > 0:
+                    market_condition = "pump"  # 폭등
+                else:
+                    market_condition = "crash"  # 폭락
+            # 횡보장 조건 (ADX < 25 AND 변동성 낮음)
+            elif adx < 25 and atr_ratio < 0.02:
+                market_condition = "sideways"  # 횡보
+            # 강한 추세 조건
+            elif adx >= 40:
+                market_condition = "strong_trend"  # 강한 추세
+            
+            logger.info(f"   Market Condition: {market_condition}")
+            logger.info(f"   Price Changes: 1m({price_change_1m:.2f}%) 5m({price_change_5m:.2f}%)")
+            
+            # 시장 상황별 신호 생성 로직
+            signal = 0
+            
+            if market_condition == "crash":  # 폭락장 - 역추세 매수 기회
+                logger.info(f"   🔴 CRASH Market Strategy")
+                # 극도 과매도 + 볼린저 밴드 하단 터치 시 매수
+                if (current['rsi'] < 25 and 
+                    current['close'] < current['bb_low'] and 
+                    volume_ratio > 1.5 and
+                    total_score >= 0.3):
+                    signal = 1
+                    logger.info(f"   ✅ CRASH REVERSAL BUY! RSI:{current['rsi']:.1f} BB_Low:{current['bb_low']:.1f}")
+                else:
+                    logger.info(f"   ❌ Crash conditions not met: RSI({current['rsi']:.1f}) BB({current['close']:.1f}>{current['bb_low']:.1f})")
+                    
+            elif market_condition == "pump":  # 폭등장 - 역추세 매도 기회
+                logger.info(f"   🟢 PUMP Market Strategy")
+                # 극도 과매수 + 볼린저 밴드 상단 터치 시 매도
+                if (current['rsi'] > 75 and 
+                    current['close'] > current['bb_high'] and 
+                    volume_ratio > 1.5 and
+                    total_score >= 0.3):
+                    signal = -1
+                    logger.info(f"   ✅ PUMP REVERSAL SELL! RSI:{current['rsi']:.1f} BB_High:{current['bb_high']:.1f}")
+                else:
+                    logger.info(f"   ❌ Pump conditions not met: RSI({current['rsi']:.1f}) BB({current['close']:.1f}<{current['bb_high']:.1f})")
+                    
+            elif market_condition == "sideways":  # 횡보장 - 볼린저 밴드 전략
+                logger.info(f"   ↔️ SIDEWAYS Market Strategy")
+                # 볼린저 밴드 상하단 터치 + 스토캐스틱 확인
+                if (current['close'] < current['bb_low'] and 
+                    current['stoch_k'] < 20 and 
+                    total_score >= 0.2):
+                    signal = 1
+                    logger.info(f"   ✅ SIDEWAYS BUY at BB_Low! Stoch:{current['stoch_k']:.1f}")
+                elif (current['close'] > current['bb_high'] and 
+                      current['stoch_k'] > 80 and 
+                      total_score >= 0.2):
+                    signal = -1
+                    logger.info(f"   ✅ SIDEWAYS SELL at BB_High! Stoch:{current['stoch_k']:.1f}")
+                else:
+                    logger.info(f"   ❌ Sideways conditions not met: BB position, Stoch:{current['stoch_k']:.1f}")
+                    
+            elif market_condition == "strong_trend":  # 강한 추세장 - 추세 추종
+                logger.info(f"   📈 STRONG TREND Market Strategy")
+                if trend == 'bearish':
+                    # 하락 추세: 풀백 후 재진입 또는 지속 하락
+                    if (signal_count <= -1.0 and 
+                        total_score >= 0.4 and
+                        current['rsi'] > 30):  # 너무 과매도되지 않은 상태에서
+                        signal = -1
+                        logger.info(f"   ✅ BEARISH TREND SELL! Count:{signal_count:.2f}")
+                    else:
+                        logger.info(f"   ❌ Bearish trend conditions not met: Count({signal_count:.2f}) RSI({current['rsi']:.1f})")
+                elif trend == 'bullish':
+                    # 상승 추세: 풀백 후 재진입 또는 지속 상승
+                    if (signal_count >= 1.0 and 
+                        total_score >= 0.4 and
+                        current['rsi'] < 70):  # 너무 과매수되지 않은 상태에서
+                        signal = 1
+                        logger.info(f"   ✅ BULLISH TREND BUY! Count:{signal_count:.2f}")
+                    else:
+                        logger.info(f"   ❌ Bullish trend conditions not met: Count({signal_count:.2f}) RSI({current['rsi']:.1f})")
+                        
+            else:  # 일반 시장 - 기존 로직
+                logger.info(f"   📊 NORMAL Market Strategy")
+                if signal_count >= 1.5 and total_score >= 0.5:
+                    signal = 1
+                    logger.info(f"   ✅ NORMAL BUY Signal!")
+                elif signal_count <= -1.5 and total_score >= 0.5:
+                    signal = -1
+                    logger.info(f"   ✅ NORMAL SELL Signal!")
+                else:
+                    logger.info(f"   ❌ Normal conditions not met: Count({signal_count:.2f}) Score({total_score:.3f})")
+            
+            # 최종 신호 확인
+            if signal != 0:
+                logger.info(f"   🎯 FINAL SIGNAL: {signal} in {market_condition} market")
             
             return {
                 'signal': signal,
@@ -764,7 +955,8 @@ class TechnicalAnalyzer:
                 'trend': trend,
                 'volume_ratio': volume_ratio,
                 'volatility': atr_ratio,
-                'adx': adx  # ADX 값 추가
+                'adx': adx,  # ADX 값 추가
+                'market_condition': market_condition  # 시장 상황 추가
             }
             
         except Exception as e:

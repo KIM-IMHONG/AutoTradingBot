@@ -498,7 +498,7 @@ class TradingBot:
             
             # Calculate stop loss and take profit prices
             stop_loss_price, take_profit_price = self.calculate_stop_loss_take_profit(
-                self.klines_data, current_price, side
+                self.klines_data, current_price, side, market_condition=market_condition
             )
             
             # Place order
@@ -563,34 +563,20 @@ class TradingBot:
             logger.error(f"Error in calculate_dynamic_leverage: {e}")
             return min(50, MAX_LEVERAGE)  # Fallback to default leverage, max 50x
 
-    def calculate_stop_loss_take_profit(self, df, entry_price, side, leverage=MAX_LEVERAGE, lookback=10, min_pct=0.3):
+    def calculate_stop_loss_take_profit(self, df, entry_price, side, leverage=MAX_LEVERAGE, lookback=10, min_pct=0.3, market_condition=None):
         """
         Calculate dynamic stop loss and take profit based on recent price action.
         Enforce a minimum distance (min_pct, now 0.3%) from entry price for 30x leverage.
         """
-        if len(df) < lookback:
-            lookback = len(df)
-        if lookback < 2:
-            atr = entry_price * 0.005  # fallback
+        # Use technical analyzer's method with market condition
+        if market_condition:
+            return self.technical_analyzer.calculate_stop_loss_take_profit(
+                df, entry_price, side, lookback=lookback, min_pct=min_pct, market_condition=market_condition
+            )
         else:
-            atr = df['atr'].tail(lookback).mean()
-        # Adjust stop loss and take profit based on leverage
-        atr_multiplier = 1.5 / leverage
-        if side == 'BUY':
-            stop_loss = entry_price - atr * atr_multiplier
-            take_profit = entry_price + atr * 2.5 * atr_multiplier
-        else:
-            stop_loss = entry_price + atr * atr_multiplier
-            take_profit = entry_price - atr * 2.5 * atr_multiplier
-        # 최소폭 강제 (0.3%)
-        min_dist = entry_price * min_pct / 100
-        if side == 'BUY':
-            stop_loss = min(stop_loss, entry_price - min_dist)
-            take_profit = max(take_profit, entry_price + min_dist * 2)
-        else:
-            stop_loss = max(stop_loss, entry_price + min_dist)
-            take_profit = min(take_profit, entry_price - min_dist * 2)
-        return stop_loss, take_profit
+            return self.technical_analyzer.calculate_stop_loss_take_profit(
+                df, entry_price, side, lookback=lookback, min_pct=min_pct
+            )
 
     async def close_position(self, reason):
         """Close current position"""
@@ -1091,7 +1077,8 @@ class TradingBot:
                             
                             if sentiment_compatible:
                                 self.logger.info(f"✅ All conditions met - executing trade")
-                                await self.execute_trade(signal, current_price, "Technical Analysis", score)
+                                market_condition = technical_analysis.get('market_condition', 'normal')
+                                await self.execute_trade(signal, current_price, market_condition, score)
                             else:
                                 self.logger.info(f"❌ Signal and sentiment mismatch. Signal: {signal}, Sentiment: {sentiment_score:.2f}")
                         else:
