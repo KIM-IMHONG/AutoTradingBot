@@ -138,16 +138,30 @@ class TradingBot:
                 logger.error(f"Failed to load historical data: {e}")
                 await self.telegram.send_message("⚠️ Warning: Failed to load historical data. Bot will start with empty data.")
 
-            if not os.path.exists('.env'):
-                logger.warning('No .env file found!')
-                await self.telegram.send_message('⚠️ .env 파일이 없습니다. 환경변수를 확인하세요!')
-            else:
-                load_dotenv()
+            # 환경변수 확인
+            try:
+                # 먼저 필요한 환경변수들이 이미 설정되어 있는지 확인
                 required_keys = ['BINANCE_API_KEY','BINANCE_API_SECRET','TELEGRAM_BOT_TOKEN','TELEGRAM_CHAT_ID']
                 missing = [k for k in required_keys if not os.getenv(k)]
+                
                 if missing:
-                    logger.warning(f'Missing env keys: {missing}')
-                    await self.telegram.send_message(f'⚠️ 환경변수 누락: {missing}')
+                    # 환경변수가 누락된 경우에만 .env 파일 확인
+                    if not os.path.exists('.env'):
+                        logger.warning('No .env file found!')
+                        await self.telegram.send_message('⚠️ .env 파일이 없습니다. 환경변수를 확인하세요!')
+                    else:
+                        load_dotenv()
+                        # .env 파일 로드 후 다시 확인
+                        missing = [k for k in required_keys if not os.getenv(k)]
+                        if missing:
+                            logger.warning(f'Missing env keys: {missing}')
+                            await self.telegram.send_message(f'⚠️ 환경변수 누락: {missing}')
+                else:
+                    logger.info('✅ All required environment variables are already set')
+            except Exception as e:
+                logger.error(f"Error checking environment variables: {e}")
+                await self.telegram.send_error(f"Error checking environment variables: {e}")
+                
         except Exception as e:
             logger.error(f"Error in initialize: {e}")
             await self.telegram.send_error(f"Error in initialize: {e}")
