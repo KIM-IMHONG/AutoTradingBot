@@ -254,12 +254,30 @@ class TechnicalAnalyzer:
                 signal -= 1
                 score += 2
                 
-            # 최종 신호 결정
+            # 최종 신호 결정 - 더 유연한 조건
             final_signal = 0
+            
+            # 1. 기본 강한 신호 (score >= 3)
             if signal > 0 and score >= 3:
                 final_signal = 1
             elif signal < 0 and score >= 3:
                 final_signal = -1
+            
+            # 2. 중간 강도 신호 + 강한 추세 (score >= 2, ADX > 30)
+            elif signal > 0 and score >= 2 and adx > 30:
+                final_signal = 1
+            elif signal < 0 and score >= 2 and adx > 30:
+                final_signal = -1
+            
+            # 3. 극단적 RSI 조건 (RSI < 25 or RSI > 75)
+            elif signal > 0 and rsi < 25 and score >= 1:
+                final_signal = 1
+            elif signal < 0 and rsi > 75 and score >= 1:
+                final_signal = -1
+            
+            # 4. 볼륨 급증 + 방향성 일치 (volume > 2x average)
+            elif signal != 0 and score >= 2 and volume_ratio > 2.0:
+                final_signal = signal
                 
             return final_signal, score, adx, market_condition
             

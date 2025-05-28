@@ -363,16 +363,18 @@ class TradingBot:
                    (combined_impact < 0 and current_side == 'LONG'):
                     await self.close_position("News impact reversal")
                     # 반대 포지션 진입
+                    current_price = self.klines_data['close'].iloc[-1]
                     if combined_impact > 0:
-                        await self.execute_trade(1, self.klines_data['close'].iloc[-1], "Strong positive news", reverse=True)
+                        await self.execute_trade(1, current_price, "Strong positive news", score=5)
                     else:
-                        await self.execute_trade(-1, self.klines_data['close'].iloc[-1], "Strong negative news", reverse=True)
+                        await self.execute_trade(-1, current_price, "Strong negative news", score=5)
             else:
                 # 새로운 포지션 진입
+                current_price = self.klines_data['close'].iloc[-1]
                 if combined_impact > self.news_threshold:
-                    await self.execute_trade(1, self.klines_data['close'].iloc[-1], "Strong positive news")
+                    await self.execute_trade(1, current_price, "Strong positive news", score=5)
                 elif combined_impact < -self.news_threshold:
-                    await self.execute_trade(-1, self.klines_data['close'].iloc[-1], "Strong negative news")
+                    await self.execute_trade(-1, current_price, "Strong negative news", score=5)
 
     async def check_risk_limits(self):
         """Check if current position is within risk limits"""
@@ -402,11 +404,11 @@ class TradingBot:
             logger.error(f"Error in check_risk_limits: {e}")
             return True
 
-    def calculate_position_size(self, current_price):
+    async def calculate_position_size(self, current_price):
         """Calculate position size based on account balance and risk management"""
         try:
             # Get account balance
-            account_info = self.binance.get_account_info()
+            account_info = await self.binance.client.futures_account()
             if not account_info:
                 self.logger.error("Failed to get account info")
                 return 0
@@ -491,62 +493,65 @@ class TradingBot:
             logger.error(f"Error in calculate_trailing_stop: {e}")
             return entry_price * 0.995 if side == 'BUY' else entry_price * 1.005
 
-    async def execute_trade(self, signal, score, market_condition):
+    async def execute_trade(self, signal, current_price, market_condition, score=0):
         """Execute trade based on signal and market conditions"""
         try:
-            # Get current price
-            current_price = float(self.klines_data['close'].iloc[-1])
-            
             # Calculate position size
-            quantity = self.calculate_position_size(current_price)
+            quantity = await self.calculate_position_size(current_price)
             if quantity <= 0:
                 self.logger.warning("Invalid position size calculated")
                 return False
             
-            # Set leverage
-            if not self.binance.set_leverage(MAX_LEVERAGE):
-                self.logger.error("Failed to set leverage")
-                return False
+            # Set leverage (only if no position exists)
+            await self.binance.set_leverage(MAX_LEVERAGE)
+            
+            # Determine side
+            side = 'BUY' if signal > 0 else 'SELL'
             
             # Calculate stop loss and take profit prices
             stop_loss_price, take_profit_price = self.calculate_stop_loss_take_profit(
-                current_price, signal
+                self.klines_data, current_price, side
             )
             
             # Place order
-            order = self.binance.place_order(
-                side=signal,
+            order = await self.binance.place_order(
+                side=side,
                 quantity=quantity,
-                stop_loss=stop_loss_price,
-                take_profit=take_profit_price
+                order_type='MARKET'
             )
             
             if order:
                 # Update position info
                 self.current_position = {
-                    'side': signal,
+                    'side': side,
                     'entry_price': current_price,
+                    'entry': current_price,
                     'quantity': quantity,
                     'stop_loss': stop_loss_price,
                     'take_profit': take_profit_price,
-                    'size': quantity * current_price
+                    'size': quantity * current_price,
+                    'positionAmt': quantity if side == 'BUY' else -quantity
                 }
                 
+                # Update trade statistics
+                self.total_trades += 1
+                
                 # Send notification
-                self.telegram.send_message(
+                await self.telegram.send_message(
                     f"🔄 Trade Executed\n"
                     f"Symbol: {self.symbol}\n"
-                    f"Side: {signal}\n"
+                    f"Side: {side}\n"
                     f"Entry Price: ${current_price:.2f}\n"
                     f"Quantity: {quantity}\n"
                     f"Position Size: ${quantity * current_price:.2f}\n"
                     f"Leverage: {MAX_LEVERAGE}x\n"
                     f"Stop Loss: ${stop_loss_price:.2f}\n"
                     f"Take Profit: ${take_profit_price:.2f}\n"
-                    f"Market Condition: {market_condition}"
+                    f"Market Condition: {market_condition}\n"
+                    f"Signal Score: {score}"
                 )
                 
-                self.logger.info(f"Trade executed successfully: {signal} {quantity} {self.symbol}")
+                self.logger.info(f"Trade executed successfully: {side} {quantity} {self.symbol}")
                 return True
             else:
                 self.logger.error("Failed to place order")
@@ -554,6 +559,7 @@ class TradingBot:
                 
         except Exception as e:
             self.logger.error(f"Error executing trade: {str(e)}")
+            await self.telegram.send_error(f"Error executing trade: {str(e)}")
             return False
 
     def calculate_dynamic_leverage(self, score, adx):
@@ -974,10 +980,40 @@ class TradingBot:
                         # 시그널 생성
                         signal, score, adx, market_condition = self.technical_analyzer.generate_signals(self.klines_data)
                         
-                        # 진입 조건 확인
+                        # 개선된 진입 조건 확인
+                        should_enter = False
+                        entry_reason = ""
+                        
+                        # 1. 기본 진입 조건 (score >= 3)
                         if signal != 0 and score >= 3:
+                            should_enter = True
+                            entry_reason = f"Strong signal (score: {score})"
+                        
+                        # 2. 강한 추세에서 완화된 조건 (ADX > 30, score >= 2)
+                        elif signal != 0 and score >= 2 and adx > 30:
+                            should_enter = True
+                            entry_reason = f"Strong trend signal (ADX: {adx:.1f}, score: {score})"
+                        
+                        # 3. 극단적 RSI 조건 (RSI < 25 or RSI > 75)
+                        elif signal != 0 and 'rsi' in self.klines_data.columns:
+                            rsi = self.klines_data['rsi'].iloc[-1]
+                            if (signal > 0 and rsi < 25) or (signal < 0 and rsi > 75):
+                                should_enter = True
+                                entry_reason = f"Extreme RSI signal (RSI: {rsi:.1f})"
+                        
+                        # 4. 볼륨 급증 + 방향성 일치
+                        elif signal != 0 and score >= 2:
+                            volume_ma = self.klines_data['volume'].rolling(20).mean().iloc[-1]
+                            current_volume = self.klines_data['volume'].iloc[-1]
+                            if current_volume > volume_ma * 2:  # 평균 거래량의 2배 이상
+                                should_enter = True
+                                entry_reason = f"High volume signal (volume: {current_volume/volume_ma:.1f}x avg)"
+                        
+                        # 진입 실행
+                        if should_enter:
                             current_price = self.klines_data['close'].iloc[-1]
-                            await self.execute_trade(signal, score, market_condition)
+                            logger.info(f"[{self.symbol}] Entry condition met: {entry_reason}")
+                            await self.execute_trade(signal, current_price, f"{market_condition} - {entry_reason}", score)
                     
                     # 6. 대기
                     await asyncio.sleep(1)
