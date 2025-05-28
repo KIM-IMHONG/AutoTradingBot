@@ -168,4 +168,38 @@ class NewsCollector:
         elif impact < -0.5:
             return "bearish"
         else:
-            return "neutral" 
+            return "neutral"
+
+    async def get_sentiment_score(self):
+        """Get sentiment score based on news analysis"""
+        try:
+            # Get news for all symbols
+            all_news = []
+            for symbol in TRADING_SYMBOLS:
+                news = self.get_news(symbol)
+                all_news.extend(news)
+            
+            if not all_news:
+                return 0
+            
+            # Calculate weighted sentiment score
+            total_weight = 0
+            weighted_score = 0
+            
+            for news in all_news:
+                # More recent news has higher weight
+                time_diff = (datetime.now() - news['timestamp']).total_seconds()
+                weight = 1 / (1 + time_diff / 3600)  # Weight decreases with time
+                
+                # Get impact from news
+                impact = news.get('impact', 0)
+                
+                weighted_score += impact * weight
+                total_weight += weight
+            
+            # Normalize score between -1 and 1
+            sentiment_score = weighted_score / total_weight if total_weight > 0 else 0
+            return max(min(sentiment_score, 1), -1)  # Clamp between -1 and 1
+        except Exception as e:
+            self.logger.error(f"Error calculating sentiment score: {e}")
+            return 0 

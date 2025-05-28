@@ -29,17 +29,14 @@ class TechnicalAnalyzer:
     def calculate_indicators(self, df):
         """Calculate all technical indicators"""
         try:
-            # 최소 데이터 포인트 확인
+            # Check minimum data points
             min_data_points = max(50, max(RSI_PERIOD, MACD_SLOW, EMA_LONG))
             if len(df) < min_data_points:
                 logger.warning(f"Insufficient data points for indicator calculation. Need at least {min_data_points}, got {len(df)}")
                 return df
 
             # RSI
-            self.rsi = RSIIndicator(
-                close=df['close'],
-                window=RSI_PERIOD
-            )
+            self.rsi = RSIIndicator(close=df['close'], window=RSI_PERIOD)
             df['rsi'] = self.rsi.rsi()
 
             # MACD
@@ -63,20 +60,25 @@ class TechnicalAnalyzer:
             df['ema_long'] = self.ema_long.ema_indicator()
 
             # Advanced indicators
-            self.calculate_advanced_indicators(df)
+            df = self.calculate_advanced_indicators(df)
 
-            # NaN 값 처리
-            indicator_cols = ['ema_short', 'ema_medium', 'ema_long', 'rsi', 'macd', 'macd_signal', 
-                            'macd_diff', 'bb_high', 'bb_low', 'stoch_k', 'stoch_d', 'atr', 'supertrend', 'adx']
+            # Validate and clean all indicators
+            indicator_cols = [
+                'ema_short', 'ema_medium', 'ema_long', 'rsi', 'macd', 
+                'macd_signal', 'macd_diff', 'bb_high', 'bb_low', 'stoch_k', 
+                'stoch_d', 'atr', 'supertrend', 'adx'
+            ]
             
             for col in indicator_cols:
                 if col in df.columns:
-                    # 앞쪽 NaN을 이전 값으로 채우기
+                    # Forward fill NaN values
                     df[col] = df[col].ffill()
-                    # 뒤쪽 NaN을 다음 값으로 채우기
+                    # Backward fill remaining NaN values
                     df[col] = df[col].bfill()
-                    # 여전히 NaN이 있다면 0으로 채우기
+                    # Fill any remaining NaN values with 0
                     df[col] = df[col].fillna(0)
+                    # Replace infinite values with 0
+                    df[col] = df[col].replace([np.inf, -np.inf], 0)
 
             return df
             
@@ -147,33 +149,159 @@ class TechnicalAnalyzer:
             return pd.Series(index=df.index, dtype=float)
 
     def calculate_advanced_indicators(self, df):
-        # Bollinger Bands
-        bb = BollingerBands(close=df['close'], window=20, window_dev=2)
-        df['bb_high'] = bb.bollinger_hband()
-        df['bb_low'] = bb.bollinger_lband()
-        df['bb_mid'] = bb.bollinger_mavg()
-        
-        # ATR
-        atr = AverageTrueRange(high=df['high'], low=df['low'], close=df['close'], window=14)
-        df['atr'] = atr.average_true_range()
-        
-        # Stochastic Oscillator
-        stoch = StochasticOscillator(high=df['high'], low=df['low'], close=df['close'], window=14, smooth_window=3)
-        df['stoch_k'] = stoch.stoch()
-        df['stoch_d'] = stoch.stoch_signal()
-        
-        # Supertrend (custom implementation)
-        df['supertrend'] = self.calculate_supertrend(df)
-        
-        # ADX (trend strength)
+        """Calculate advanced technical indicators including ADX"""
         try:
-            from ta.trend import ADXIndicator
-            adx = ADXIndicator(high=df['high'], low=df['low'], close=df['close'], window=14)
-            df['adx'] = adx.adx()
-        except Exception:
-            df['adx'] = np.nan
+            # Ensure we have enough data
+            if len(df) < 30:
+                logger.warning(f"Not enough data for advanced indicators: {len(df)} rows")
+                # Initialize with zeros
+                df['bb_high'] = df['close']
+                df['bb_low'] = df['close']
+                df['bb_mid'] = df['close']
+                df['atr'] = 0
+                df['stoch_k'] = 50
+                df['stoch_d'] = 50
+                df['supertrend'] = df['close']
+                df['adx'] = 0
+                return df
+
+            # Bollinger Bands
+            try:
+                bb = BollingerBands(close=df['close'], window=20, window_dev=2)
+                df['bb_high'] = bb.bollinger_hband().fillna(df['close'])
+                df['bb_low'] = bb.bollinger_lband().fillna(df['close'])
+                df['bb_mid'] = bb.bollinger_mavg().fillna(df['close'])
+            except Exception as e:
+                logger.error(f"Error calculating Bollinger Bands: {e}")
+                df['bb_high'] = df['close']
+                df['bb_low'] = df['close']
+                df['bb_mid'] = df['close']
             
-        return df
+            # ATR
+            try:
+                atr = AverageTrueRange(high=df['high'], low=df['low'], close=df['close'], window=14)
+                df['atr'] = atr.average_true_range().fillna(0)
+            except Exception as e:
+                logger.error(f"Error calculating ATR: {e}")
+                df['atr'] = 0
+            
+            # Stochastic Oscillator
+            try:
+                stoch = StochasticOscillator(high=df['high'], low=df['low'], close=df['close'], window=14, smooth_window=3)
+                df['stoch_k'] = stoch.stoch().fillna(50)
+                df['stoch_d'] = stoch.stoch_signal().fillna(50)
+            except Exception as e:
+                logger.error(f"Error calculating Stochastic: {e}")
+                df['stoch_k'] = 50
+                df['stoch_d'] = 50
+            
+            # Supertrend
+            try:
+                df['supertrend'] = self.calculate_supertrend(df)
+                df['supertrend'] = df['supertrend'].fillna(df['close'])
+            except Exception as e:
+                logger.error(f"Error calculating Supertrend: {e}")
+                df['supertrend'] = df['close']
+            
+            # ADX Calculation - Simplified and robust
+            try:
+                # Calculate True Range
+                high_low = df['high'] - df['low']
+                high_close = np.abs(df['high'] - df['close'].shift(1))
+                low_close = np.abs(df['low'] - df['close'].shift(1))
+                
+                true_range = np.maximum(high_low, np.maximum(high_close, low_close))
+                
+                # Calculate Directional Movement
+                up_move = df['high'] - df['high'].shift(1)
+                down_move = df['low'].shift(1) - df['low']
+                
+                # +DM and -DM
+                plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0)
+                minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0)
+                
+                # Convert to Series for easier handling
+                tr_series = pd.Series(true_range, index=df.index)
+                plus_dm_series = pd.Series(plus_dm, index=df.index)
+                minus_dm_series = pd.Series(minus_dm, index=df.index)
+                
+                # Calculate 14-period smoothed values using simple moving average
+                tr14 = tr_series.rolling(window=14, min_periods=1).mean()
+                plus_dm14 = plus_dm_series.rolling(window=14, min_periods=1).mean()
+                minus_dm14 = minus_dm_series.rolling(window=14, min_periods=1).mean()
+                
+                # Calculate +DI and -DI
+                # Avoid division by zero
+                tr14_safe = tr14.replace(0, 0.0001)  # Replace 0 with small number
+                plus_di = 100 * (plus_dm14 / tr14_safe)
+                minus_di = 100 * (minus_dm14 / tr14_safe)
+                
+                # Calculate DX
+                di_sum = plus_di + minus_di
+                di_sum_safe = di_sum.replace(0, 0.0001)  # Avoid division by zero
+                dx = 100 * np.abs(plus_di - minus_di) / di_sum_safe
+                
+                # Calculate ADX (14-period smoothed DX)
+                adx = dx.rolling(window=14, min_periods=1).mean()
+                
+                # Fill any remaining NaN values
+                df['adx'] = adx.fillna(0)
+                
+                # Ensure ADX is within reasonable bounds (0-100)
+                df['adx'] = df['adx'].clip(0, 100)
+                
+                # Logging
+                current_adx = df['adx'].iloc[-1]
+                logger.info(f"Current ADX value: {current_adx:.2f}")
+                
+                if current_adx < 5:  # Changed threshold from 0 to 5
+                    logger.warning(f"ADX is very low: {current_adx:.2f}")
+                    logger.info(f"Last 5 ADX values: {df['adx'].tail().values}")
+                    logger.info(f"Last 5 +DI values: {plus_di.tail().values}")
+                    logger.info(f"Last 5 -DI values: {minus_di.tail().values}")
+                    logger.info(f"Last 5 DX values: {dx.tail().values}")
+                
+            except Exception as e:
+                logger.error(f"Error in ADX calculation: {e}")
+                df['adx'] = 25  # Default to moderate trend strength
+            
+            # Final validation - ensure no NaN or infinite values
+            indicator_cols = ['bb_high', 'bb_low', 'bb_mid', 'atr', 'stoch_k', 'stoch_d', 'supertrend', 'adx']
+            for col in indicator_cols:
+                if col in df.columns:
+                    # Replace NaN values
+                    if col in ['stoch_k', 'stoch_d']:
+                        df[col] = df[col].fillna(50)  # Neutral value for stochastic
+                    elif col == 'adx':
+                        df[col] = df[col].fillna(25)  # Moderate trend strength
+                    elif col == 'atr':
+                        df[col] = df[col].fillna(0)
+                    else:
+                        df[col] = df[col].fillna(df['close'])  # Use close price as fallback
+                    
+                    # Replace infinite values
+                    df[col] = df[col].replace([np.inf, -np.inf], 0)
+                    
+                    # Ensure reasonable bounds
+                    if col in ['stoch_k', 'stoch_d']:
+                        df[col] = df[col].clip(0, 100)
+                    elif col == 'adx':
+                        df[col] = df[col].clip(0, 100)
+            
+            return df
+            
+        except Exception as e:
+            logger.error(f"Error in calculate_advanced_indicators: {e}")
+            # Return with default values
+            df['bb_high'] = df['close']
+            df['bb_low'] = df['close']
+            df['bb_mid'] = df['close']
+            df['atr'] = 0
+            df['stoch_k'] = 50
+            df['stoch_d'] = 50
+            df['supertrend'] = df['close']
+            df['adx'] = 25
+            return df
 
     def generate_signals(self, df):
         """Generate trading signals based on technical indicators"""
@@ -500,3 +628,144 @@ class TechnicalAnalyzer:
         if return_details:
             return (result, signal_score, adx, market_info)
         return result 
+
+    def analyze(self, df):
+        """Analyze market conditions and generate trading signals"""
+        try:
+            if df.empty:
+                return {'signal': 0, 'score': 0, 'trend': 'neutral'}
+            
+            # Calculate indicators if not present
+            if 'rsi' not in df.columns:
+                df = self.calculate_indicators(df)
+            
+            # Get latest values
+            current = df.iloc[-1]
+            
+            # Analyze trend based on EMAs
+            trend = 'neutral'
+            if current['ema_short'] > current['ema_medium'] > current['ema_long']:
+                trend = 'bullish'
+            elif current['ema_short'] < current['ema_medium'] < current['ema_long']:
+                trend = 'bearish'
+            
+            # Analyze volume
+            volume_ma = df['volume'].rolling(window=20).mean().iloc[-1]
+            volume_ratio = current['volume'] / volume_ma if volume_ma > 0 else 1
+            
+            # Analyze volatility
+            atr = current['atr']
+            atr_ratio = atr / current['close'] if current['close'] > 0 else 0
+            
+            # Generate signal based on indicators (더 엄격한 조건)
+            signal_count = 0
+            total_score = 0
+            
+            # RSI signals (더 극단적인 값에서만 신호 생성)
+            if current['rsi'] < 25:  # 극도 과매도
+                signal_count += 1
+                total_score += 0.4
+            elif current['rsi'] > 75:  # 극도 과매수
+                signal_count -= 1
+                total_score += 0.4
+            elif current['rsi'] < 35:  # 과매도
+                signal_count += 0.5
+                total_score += 0.2
+            elif current['rsi'] > 65:  # 과매수
+                signal_count -= 0.5
+                total_score += 0.2
+            
+            # MACD signals (크로스오버와 히스토그램 모두 확인)
+            macd_diff = current['macd'] - current['macd_signal']
+            if len(df) > 1:
+                prev_macd_diff = df['macd'].iloc[-2] - df['macd_signal'].iloc[-2]
+                # MACD 크로스오버 확인
+                if macd_diff > 0 and prev_macd_diff <= 0:  # 골든 크로스
+                    signal_count += 1
+                    total_score += 0.3
+                elif macd_diff < 0 and prev_macd_diff >= 0:  # 데드 크로스
+                    signal_count -= 1
+                    total_score += 0.3
+                elif macd_diff > 0:  # MACD가 시그널 위에 있음
+                    signal_count += 0.3
+                    total_score += 0.1
+                elif macd_diff < 0:  # MACD가 시그널 아래에 있음
+                    signal_count -= 0.3
+                    total_score += 0.1
+            
+            # EMA signals (3개 EMA 모두 확인)
+            if current['ema_short'] > current['ema_medium'] > current['ema_long']:
+                signal_count += 1
+                total_score += 0.3
+            elif current['ema_short'] < current['ema_medium'] < current['ema_long']:
+                signal_count -= 1
+                total_score += 0.3
+            elif current['ema_short'] > current['ema_medium']:
+                signal_count += 0.5
+                total_score += 0.15
+            elif current['ema_short'] < current['ema_medium']:
+                signal_count -= 0.5
+                total_score += 0.15
+            
+            # Stochastic signals (더 극단적인 값에서만)
+            if current['stoch_k'] < 15 and current['stoch_d'] < 15:
+                signal_count += 1
+                total_score += 0.25
+            elif current['stoch_k'] > 85 and current['stoch_d'] > 85:
+                signal_count -= 1
+                total_score += 0.25
+            elif current['stoch_k'] < 25 and current['stoch_d'] < 25:
+                signal_count += 0.5
+                total_score += 0.15
+            elif current['stoch_k'] > 75 and current['stoch_d'] > 75:
+                signal_count -= 0.5
+                total_score += 0.15
+            
+            # ADX 확인 (추세 강도)
+            adx = current.get('adx', 25)
+            if adx < 20:  # 약한 추세 - 신호 무효화
+                signal_count = 0
+                total_score = 0
+            elif adx < 30:  # 보통 추세 - 신호 약화
+                signal_count *= 0.7
+                total_score *= 0.7
+            elif adx >= 40:  # 강한 추세 - 신호 강화
+                signal_count *= 1.3
+                total_score *= 1.3
+            
+            # Volume confirmation (거래량 확인)
+            if volume_ratio > 1.8:  # 높은 거래량
+                total_score *= 1.3
+            elif volume_ratio > 1.3:  # 보통 거래량
+                total_score *= 1.1
+            elif volume_ratio < 0.7:  # 낮은 거래량 - 신호 약화
+                total_score *= 0.7
+            
+            # Volatility adjustment (변동성 조정)
+            if atr_ratio > 0.03:  # 높은 변동성 - 더 보수적
+                total_score *= 0.6
+            elif atr_ratio > 0.02:  # 보통 변동성
+                total_score *= 0.8
+            
+            # 최종 신호 결정 (더 엄격한 조건)
+            if signal_count >= 2.0 and total_score >= 0.6:  # 강한 매수 신호
+                signal = 1
+            elif signal_count <= -2.0 and total_score >= 0.6:  # 강한 매도 신호
+                signal = -1
+            else:
+                signal = 0  # 신호 없음
+            
+            # 최종 점수 정규화
+            score = min(total_score, 1.0)
+            
+            return {
+                'signal': signal,
+                'score': score,
+                'trend': trend,
+                'volume_ratio': volume_ratio,
+                'volatility': atr_ratio
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Error in analyze: {e}")
+            return {'signal': 0, 'score': 0, 'trend': 'neutral'} 

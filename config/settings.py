@@ -11,7 +11,7 @@ TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 
 # Trading Settings
-TRADING_SYMBOLS = os.getenv('TRADING_SYMBOLS', 'BTCUSDT,ETHUSDT').split(',')
+TRADING_SYMBOLS = os.getenv('TRADING_SYMBOLS', 'BTCUSDT').split(',')
 MAX_POSITION_SIZE = float(os.getenv('MAX_POSITION_SIZE', '200'))  # USDT
 MAX_LEVERAGE = int(os.getenv('MAX_LEVERAGE', '50'))  # Maximum leverage
 POSITION_RATIO = float(os.getenv('POSITION_RATIO', '100'))  # Percentage of balance to use

@@ -35,6 +35,7 @@ class TradingBot:
         self.binance = BinanceClient(self.symbol)
         self.news_collector = NewsCollector()
         self.technical_analyzer = TechnicalAnalyzer(self.symbol)
+        self.signal_generator = SignalGenerator(self.symbol)
         self.telegram = TelegramBot()
         self.current_position = None
         self.daily_pnl = 0
@@ -43,32 +44,29 @@ class TradingBot:
         self.news_threshold = 0.7  # 뉴스 영향도 임계값
         self.last_position_info = None
         self.last_trade_time = 0
-        self.min_trade_interval = 30  # 최소 거래 간격 (초) - 60초에서 30초로 완화
-        self.signal_confirmation_count = 0  # 신호 확인 카운트
-        self.required_signal_confirmation = 1  # 필요한 신호 확인 횟수 - 2에서 1로 완화
-        self.last_signal = 0  # 마지막 신호
-        self.signal_history = []  # (signal, score, adx)
-        self.signal_history_limit = 5  # 10에서 5로 감소
+        self.min_trade_interval = 30  # 최소 거래 간격 (초)
+        self.signal_confirmation_count = 0
+        self.required_signal_confirmation = 1
+        self.last_signal = 0
+        self.signal_history = []
+        self.signal_history_limit = 5
         self.reversal_confirmation = 0
-        # 새로운 개선 사항들
-        self.account_balance = 0  # 계좌 잔고
-        self.max_drawdown = 0  # 최대 손실률
-        self.peak_balance = 0  # 최고 잔고
-        self.win_rate = 0  # 승률
-        self.total_trades = 0  # 총 거래 수
-        self.winning_trades = 0  # 승리 거래 수
-        self.trailing_stop_enabled = True  # 트레일링 스탑 활성화
-        self.volatility_threshold = 0.02  # 변동성 임계값 (2%)
-        # NaN 체크 관련 변수 추가
-        self.last_nan_check_time = None  # 마지막 NaN 체크 시간
-        self.nan_check_interval = 60  # NaN 체크 간격 (초)
-        self.data_accumulation_complete = False  # 데이터 축적 완료 여부
-        # 신호 검증 관련 변수 추가
-        self.last_signal_warning_time = None  # 마지막 신호 경고 시간
-        self.signal_warning_interval = 60  # 신호 경고 간격 (초)
+        self.account_balance = 0
+        self.max_drawdown = 0
+        self.peak_balance = 0
+        self.win_rate = 0
+        self.total_trades = 0
+        self.winning_trades = 0
+        self.trailing_stop_enabled = True
+        self.volatility_threshold = 0.02
+        self.last_nan_check_time = None
+        self.nan_check_interval = 60
+        self.data_accumulation_complete = False
+        self.last_signal_warning_time = None
+        self.signal_warning_interval = 60
         self.daily_loss = 0
         self.daily_loss_reset_time = time.time()
-        self.position_ratio = POSITION_RATIO / 100  # Convert percentage to decimal
+        self.position_ratio = POSITION_RATIO / 100
         self.stop_loss_percentage = STOP_LOSS_PERCENTAGE
         self.take_profit_percentage = TAKE_PROFIT_PERCENTAGE
         self.max_daily_loss = MAX_DAILY_LOSS
@@ -155,43 +153,35 @@ class TradingBot:
             await self.telegram.send_error(f"Error in initialize: {e}")
 
     def validate_data_integrity(self):
-        """데이터 무결성 검증"""
+        """Validate the integrity of market data"""
         try:
-            if len(self.klines_data) < 50:
-                logger.warning(f"Insufficient data: only {len(self.klines_data)} rows available")
+            if self.klines_data.empty:
+                self.logger.warning("Klines data is empty")
                 return False
-            
-            required_cols = ['open', 'high', 'low', 'close', 'volume']
-            
-            # 필수 컬럼 존재 확인
-            for col in required_cols:
-                if col not in self.klines_data.columns:
-                    logger.warning(f"Missing required column: {col}")
-                    return False
-            
-            # NaN 값 확인
-            if self.klines_data[required_cols].isnull().any().any():
-                logger.warning("NaN values detected in price data")
-                # NaN 값을 이전 값으로 채우기
-                self.klines_data[required_cols] = self.klines_data[required_cols].ffill()
-                # 여전히 NaN이 있다면 다음 값으로 채우기
-                self.klines_data[required_cols] = self.klines_data[required_cols].bfill()
-            
-            # 가격 데이터 유효성 검증
+                
+            # Check for required columns
+            required_columns = ['open', 'high', 'low', 'close', 'volume']
+            missing_columns = [col for col in required_columns if col not in self.klines_data.columns]
+            if missing_columns:
+                self.logger.warning(f"Missing required columns: {missing_columns}")
+                return False
+                
+            # Check for NaN values in required columns
+            nan_columns = self.klines_data[required_columns].columns[self.klines_data[required_columns].isna().any()].tolist()
+            if nan_columns:
+                self.logger.warning(f"NaN values found in columns: {nan_columns}")
+                return False
+                
+            # Check for zero or negative values
             for col in ['open', 'high', 'low', 'close']:
                 if (self.klines_data[col] <= 0).any():
-                    logger.warning(f"Invalid price data detected in {col}")
+                    self.logger.warning(f"Zero or negative values found in {col}")
                     return False
-            
-            # High >= Low 검증
-            if (self.klines_data['high'] < self.klines_data['low']).any():
-                logger.warning("Invalid OHLC data: high < low detected")
-                return False
-            
+                    
             return True
             
         except Exception as e:
-            logger.error(f"Error in validate_data_integrity: {e}")
+            self.logger.error(f"Error in validate_data_integrity: {e}")
             return False
 
     def should_check_nan_values(self):
@@ -417,11 +407,8 @@ class TradingBot:
             # Get USDT balance
             usdt_balance = float(account_info['totalWalletBalance'])
             
-            # Calculate position size based on balance and position ratio
-            position_size = usdt_balance * self.position_ratio
-            
-            # Ensure position size doesn't exceed maximum
-            position_size = min(position_size, MAX_POSITION_SIZE)
+            # Calculate position size as 50% of total balance
+            position_size = usdt_balance * 0.5  # 50% of total balance
             
             # Calculate quantity based on current price
             quantity = position_size / current_price
@@ -434,7 +421,7 @@ class TradingBot:
             else:
                 quantity = round(quantity, 2)  # Default to 2 decimal places
             
-            self.logger.info(f"Calculated position size: {quantity} {self.symbol} (${position_size})")
+            self.logger.info(f"Calculated position size: {quantity} {self.symbol} (${position_size:.2f})")
             return quantity
             
         except Exception as e:
@@ -930,94 +917,191 @@ class TradingBot:
         try:
             # 연결 상태 확인
             if not self.binance.is_connected:
-                self.logger.warning("WebSocket not connected, skipping data processing")
+                self.logger.warning("WebSocket not connected, attempting to reconnect...")
+                await self.binance.reconnect()
                 return
             
             # 데이터 유효성 검사
             current_time = time.time()
             data_timestamp = kline_data['timestamp'].timestamp()
             
-            # 1분 이상 오래된 데이터 무시
-            if current_time - data_timestamp > 60:
-                self.logger.warning(f"Ignoring outdated data: {current_time - data_timestamp:.1f} seconds old")
+            # 데이터 신선도 체크 (5초 이상 지난 데이터는 무시)
+            if current_time - data_timestamp > 5:
+                if not hasattr(self, 'last_outdated_warning_time'):
+                    self.last_outdated_warning_time = 0
+                
+                # 경고 메시지는 5분에 한 번만 출력
+                if current_time - self.last_outdated_warning_time > 300:
+                    self.logger.warning(f"Received outdated data: {current_time - data_timestamp:.1f} seconds old. Checking connection...")
+                    self.last_outdated_warning_time = current_time
+                    
+                    # 연결 상태 재확인 및 필요시 재연결
+                    if not self.binance.is_connected:
+                        await self.binance.reconnect()
                 return
             
-            # Rate limit 상태 모니터링
-            rate_status = self.binance.get_rate_limit_status()
-            if rate_status['requests_per_minute'] > rate_status['max_requests_per_minute'] * 0.8:
-                self.logger.warning(f"API usage high: {rate_status['requests_per_minute']}/{rate_status['max_requests_per_minute']} requests/min")
+            # 로그 출력 제한 (30초마다 한 번씩만 출력)
+            if not hasattr(self, 'last_log_time'):
+                self.last_log_time = 0
+            if current_time - self.last_log_time < 30:  # 60초에서 30초로 변경
+                return
+            self.last_log_time = current_time
             
-            # 현재 가격 로깅
+            # Rate limit 상태 모니터링 (5분마다 한 번만 체크)
+            if not hasattr(self, 'last_rate_check_time'):
+                self.last_rate_check_time = 0
+            if current_time - self.last_rate_check_time > 300:
+                rate_status = self.binance.get_rate_limit_status()
+                if rate_status['requests_per_minute'] > rate_status['max_requests_per_minute'] * 0.8:
+                    self.logger.warning(f"API usage high: {rate_status['requests_per_minute']}/{rate_status['max_requests_per_minute']} requests/min")
+                self.last_rate_check_time = current_time
+            
+            # 현재 가격 로깅 (30초마다)
             current_price = kline_data['close']
             self.logger.info(f"Current price: {current_price}")
             
-            # 레버리지 업데이트 (필요시)
-            new_leverage = await self.binance.update_leverage_if_needed()
-            if new_leverage:
-                self.logger.info(f"Leverage updated to {new_leverage}x")
+            # 레버리지 업데이트 (필요시, 1시간마다 한 번만 체크)
+            if not hasattr(self, 'last_leverage_check_time'):
+                self.last_leverage_check_time = 0
+            if current_time - self.last_leverage_check_time > 3600:
+                new_leverage = await self.binance.update_leverage_if_needed()
+                if new_leverage:
+                    self.logger.info(f"Leverage updated to {new_leverage}x")
+                self.last_leverage_check_time = current_time
             
-            # 기존 포지션 확인 및 분석 (캐시된 데이터 사용)
-            position = await self.binance.get_position()
-            
-            if position and abs(float(position.get('positionAmt', 0))) > 0:
-                # 포지션이 있는 경우 - 분석 수행
-                entry_price = float(position.get('entryPrice', 0))
-                position_amt = float(position.get('positionAmt', 0))
-                is_long = position_amt > 0
+            # 기존 포지션 확인 및 분석 (30초마다 한 번만 체크)
+            if not hasattr(self, 'last_position_check_time'):
+                self.last_position_check_time = 0
+            if current_time - self.last_position_check_time > 30:  # 60초에서 30초로 변경
+                position = await self.binance.get_position()
                 
-                # 수익률 계산
-                if is_long:
-                    pnl_percentage = (current_price - entry_price) / entry_price * 100
+                if position and abs(float(position.get('positionAmt', 0))) > 0:
+                    # 포지션이 있는 경우 - 분석 수행
+                    entry_price = float(position.get('entryPrice', 0))
+                    position_amt = float(position.get('positionAmt', 0))
+                    is_long = position_amt > 0
+                    
+                    # 수익률 계산
+                    if is_long:
+                        pnl_percentage = (current_price - entry_price) / entry_price * 100
+                    else:
+                        pnl_percentage = (entry_price - current_price) / entry_price * 100
+                    
+                    self.logger.info(f"Position PnL: {pnl_percentage:.2f}%")
+                    
+                    # 손절/익절 로직
+                    if pnl_percentage < -5:  # 5% 손실
+                        self.logger.warning("Large loss detected, closing position")
+                        await self.close_position("Stop loss triggered")
+                        return
+                    elif pnl_percentage > 10:  # 10% 수익
+                        self.logger.info("Large profit detected, closing position")
+                        await self.close_position("Take profit triggered")
+                        return
+                
+                self.last_position_check_time = current_time
+            
+            # 기술적 분석 수행 (30초마다 한 번만)
+            if not hasattr(self, 'last_analysis_time'):
+                self.last_analysis_time = 0
+            if current_time - self.last_analysis_time > 30:  # 60초에서 30초로 변경
+                await self.update_klines(kline_data)
+                
+                # 데이터 충분성 확인
+                if len(self.klines_data) < 50:
+                    self.logger.warning(f"Insufficient data for analysis: {len(self.klines_data)} rows")
+                    return
+                
+                # 기술적 분석 수행
+                technical_analysis = self.technical_analyzer.analyze(self.klines_data)
+                
+                # 뉴스 감정 분석 (캐시된 결과 사용)
+                sentiment_score = await self.news_collector.get_sentiment_score()
+                
+                # 신호 생성
+                signal, score, adx = self.signal_generator.generate_signal(
+                    technical_analysis, 
+                    sentiment_score, 
+                    current_price
+                )
+                
+                # 로깅 개선
+                self.logger.info(f"Technical Analysis - Signal: {technical_analysis['signal']}, Score: {technical_analysis['score']:.2f}, Trend: {technical_analysis['trend']}")
+                self.logger.info(f"Sentiment Score: {sentiment_score:.2f}")
+                self.logger.info(f"Generated Signal: {signal}, Score: {score:.2f}, ADX: {adx:.2f}")
+                
+                # 지표 기반의 정확한 거래 조건 설정
+                min_confidence = 0.6  # 신뢰도 임계값을 0.6으로 상향 조정
+                adx_threshold = 25    # ADX 임계값을 25로 상향 조정 (명확한 추세 필요)
+                
+                # 추가 지표 확인 (여러 지표가 일치할 때만 거래)
+                rsi = self.klines_data['rsi'].iloc[-1] if 'rsi' in self.klines_data.columns else 50
+                macd = self.klines_data['macd'].iloc[-1] if 'macd' in self.klines_data.columns else 0
+                macd_signal = self.klines_data['macd_signal'].iloc[-1] if 'macd_signal' in self.klines_data.columns else 0
+                ema_short = self.klines_data['ema_short'].iloc[-1] if 'ema_short' in self.klines_data.columns else current_price
+                ema_medium = self.klines_data['ema_medium'].iloc[-1] if 'ema_medium' in self.klines_data.columns else current_price
+                
+                # 지표 일치도 확인
+                indicator_agreement = 0
+                
+                # RSI 신호 확인
+                if signal > 0 and rsi < 70:  # 매수 신호이면서 과매수가 아닌 경우
+                    indicator_agreement += 1
+                elif signal < 0 and rsi > 30:  # 매도 신호이면서 과매도가 아닌 경우
+                    indicator_agreement += 1
+                
+                # MACD 신호 확인
+                if signal > 0 and macd > macd_signal:  # 매수 신호이면서 MACD가 시그널 위에 있는 경우
+                    indicator_agreement += 1
+                elif signal < 0 and macd < macd_signal:  # 매도 신호이면서 MACD가 시그널 아래에 있는 경우
+                    indicator_agreement += 1
+                
+                # EMA 추세 확인
+                if signal > 0 and ema_short > ema_medium:  # 매수 신호이면서 단기 EMA가 중기 EMA 위에 있는 경우
+                    indicator_agreement += 1
+                elif signal < 0 and ema_short < ema_medium:  # 매도 신호이면서 단기 EMA가 중기 EMA 아래에 있는 경우
+                    indicator_agreement += 1
+                
+                # 최소 2개 이상의 지표가 일치해야 거래 실행
+                min_indicator_agreement = 2
+                
+                self.logger.info(f"📊 Indicator Analysis - RSI: {rsi:.2f}, MACD: {macd:.4f}, Signal: {macd_signal:.4f}")
+                self.logger.info(f"📊 EMA Analysis - Short: {ema_short:.2f}, Medium: {ema_medium:.2f}")
+                self.logger.info(f"📊 Indicator Agreement: {indicator_agreement}/{min_indicator_agreement}")
+                
+                # 거래 조건 검증
+                if adx >= adx_threshold:
+                    if score >= min_confidence:
+                        if indicator_agreement >= min_indicator_agreement:
+                            # WebSocket 연결 상태 재확인
+                            if not self.binance.is_connected:
+                                self.logger.warning("WebSocket disconnected during signal processing, skipping trade")
+                                return
+                            
+                            # 뉴스 감정 점수 확인 (보다 엄격한 조건)
+                            sentiment_threshold = 0.3
+                            sentiment_compatible = False
+                            
+                            if signal > 0 and sentiment_score > -sentiment_threshold:
+                                sentiment_compatible = True
+                            elif signal < 0 and sentiment_score < sentiment_threshold:
+                                sentiment_compatible = True
+                            elif abs(sentiment_score) < 0.1:  # 중립적인 감정일 때만 허용 (더 엄격)
+                                sentiment_compatible = True
+                            
+                            if sentiment_compatible:
+                                self.logger.info(f"✅ All conditions met - executing trade")
+                                await self.execute_trade(signal, current_price, "Technical Analysis", score)
+                            else:
+                                self.logger.info(f"❌ Signal and sentiment mismatch. Signal: {signal}, Sentiment: {sentiment_score:.2f}")
+                        else:
+                            self.logger.info(f"❌ Insufficient indicator agreement: {indicator_agreement} < {min_indicator_agreement}")
+                    else:
+                        self.logger.info(f"❌ Signal confidence too low: {score:.2f} < {min_confidence}")
                 else:
-                    pnl_percentage = (entry_price - current_price) / entry_price * 100
+                    self.logger.info(f"❌ ADX too low: {adx:.2f} < {adx_threshold} (trend not strong enough)")
                 
-                self.logger.info(f"Position PnL: {pnl_percentage:.2f}%")
-                
-                # 손절/익절 로직
-                if pnl_percentage < -5:  # 5% 손실
-                    self.logger.warning("Large loss detected, closing position")
-                    await self.close_position()
-                    return
-                elif pnl_percentage > 10:  # 10% 수익
-                    self.logger.info("Large profit detected, closing position")
-                    await self.close_position()
-                    return
-            
-            # 기술적 분석 수행
-            self.update_klines(kline_data)
-            technical_analysis = self.technical_analyzer.analyze(self.klines_data)
-            
-            # 뉴스 감정 분석 (캐시된 결과 사용)
-            sentiment_score = await self.news_collector.get_sentiment_score()
-            
-            # 신호 생성
-            signal = self.signal_generator.generate_signal(
-                technical_analysis, 
-                sentiment_score, 
-                current_price
-            )
-            
-            # 연결 불안정 시 더 높은 신뢰도 요구
-            min_confidence = 2.5 if self.binance.reconnect_attempts > 0 else 2.0
-            
-            if signal and signal['score'] >= min_confidence:
-                # WebSocket 연결 상태 재확인
-                if not self.binance.is_connected:
-                    self.logger.warning("WebSocket disconnected during signal processing, skipping trade")
-                    return
-                
-                await self.execute_trade(signal, current_price)
-            else:
-                if signal:
-                    self.logger.info(f"Signal confidence too low: {signal['score']:.2f} < {min_confidence}")
-                
-            # Rate limit 상태 주기적 로깅
-            if hasattr(self, 'last_rate_log_time'):
-                if current_time - self.last_rate_log_time > 300:  # 5분마다
-                    self.logger.info(f"API Status: {rate_status}")
-                    self.last_rate_log_time = current_time
-            else:
-                self.last_rate_log_time = current_time
+                self.last_analysis_time = current_time
                 
         except Exception as e:
             self.logger.error(f"Error handling kline data: {e}")
@@ -1114,6 +1198,49 @@ class TradingBot:
             except Exception as e:
                 self.logger.error(f"Error monitoring API usage: {e}")
                 await asyncio.sleep(60)
+
+    async def load_initial_data(self):
+        """Load initial historical data and calculate indicators"""
+        try:
+            logger.info("📊 Loading initial historical data...")
+            
+            # Load historical data
+            historical_data = await self.binance.get_historical_klines(interval='1m', limit=500)
+            logger.info(f"📊 Loaded {len(historical_data)} historical data points")
+            
+            if len(historical_data) < 50:
+                logger.warning("Insufficient 1m historical data. Trying with 5m interval.")
+                historical_data = await self.binance.get_historical_klines(interval='5m', limit=200)
+                logger.info(f"📊 Loaded {len(historical_data)} 5m historical data points")
+            
+            self.klines_data = historical_data
+            
+            # Calculate technical indicators
+            if self.validate_data_integrity():
+                logger.info("📈 Calculating technical indicators...")
+                self.klines_data = self.technical_analyzer.calculate_indicators(self.klines_data)
+                
+                # Handle NaN values
+                indicator_cols = ['ema_short', 'ema_medium', 'ema_long', 'rsi', 'macd', 'macd_signal', 
+                                'macd_diff', 'bb_high', 'bb_low', 'stoch_k', 'stoch_d', 'atr', 'supertrend', 'adx']
+                
+                for col in indicator_cols:
+                    if col in self.klines_data.columns:
+                        self.klines_data[col] = self.klines_data[col].ffill().bfill()
+                
+                if len(self.klines_data) >= 100:
+                    self.data_accumulation_complete = True
+                    logger.info(f"✅ Data accumulation complete with {len(self.klines_data)} data points")
+                    logger.info("📊 Initial indicators calculated successfully")
+                
+                await self.telegram.send_message(f"🤖 Initial data loaded: {len(self.klines_data)} data points")
+            else:
+                await self.telegram.send_message("⚠️ Warning: Data integrity issues detected")
+                
+        except Exception as e:
+            logger.error(f"Error in load_initial_data: {e}")
+            await self.telegram.send_error(f"Error loading initial data: {e}")
+            raise
 
 async def main():
     """Main function with API monitoring"""
