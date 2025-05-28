@@ -9,6 +9,7 @@ import websockets
 import json
 import numpy as np
 from binance.client import Client
+import time
 
 class BinanceClient:
     def __init__(self, symbol=None):
@@ -123,33 +124,78 @@ class BinanceClient:
                     self.logger.error(f"Max reconnection attempts ({self.max_reconnect_attempts}) reached. Stopping.")
                     raise
                 
-                # 지수 백오프: 재연결 시도마다 대기 시간 증가
-                delay = min(self.reconnect_delay * (2 ** (self.reconnect_attempts - 1)), 300)  # 최대 5분
-                self.logger.warning(f"WebSocket connection failed (attempt {self.reconnect_attempts}/{self.max_reconnect_attempts}). Reconnecting in {delay} seconds...")
+                # 개선된 지수 백오프: 네트워크 상태에 따른 적응적 대기
+                base_delay = 2  # 기본 2초
+                max_delay = 60  # 최대 1분
+                
+                # 연속 실패 횟수에 따른 지수 백오프
+                delay = min(base_delay * (1.5 ** (self.reconnect_attempts - 1)), max_delay)
+                
+                # 특정 에러 타입에 따른 대기 시간 조정
+                error_msg = str(e).lower()
+                if "timeout" in error_msg or "ping" in error_msg:
+                    delay = min(delay, 10)  # ping 타임아웃은 빠른 재연결
+                elif "connection refused" in error_msg:
+                    delay = max(delay, 30)  # 서버 거부는 더 긴 대기
+                
+                self.logger.warning(f"WebSocket connection failed (attempt {self.reconnect_attempts}/{self.max_reconnect_attempts}). Reconnecting in {delay:.1f} seconds...")
+                self.logger.info(f"Error details: {e}")
+                
                 await asyncio.sleep(delay)
+                
+                # 5번 연속 실패 시 연결 방식 변경 시도
+                if self.reconnect_attempts % 5 == 0:
+                    self.logger.info("Trying alternative connection approach...")
+                    # 잠시 더 긴 대기로 네트워크 안정화
+                    await asyncio.sleep(5)
 
     async def _stream_klines_with_reconnect(self, callback):
         """Internal method for WebSocket streaming with connection handling"""
-        url = f"wss://fstream.binance.com/ws/{self.symbol.lower()}@kline_1m"
+        # 여러 서버 엔드포인트 시도
+        endpoints = [
+            f"wss://fstream.binance.com/ws/{self.symbol.lower()}@kline_1m",
+            f"wss://fstream1.binance.com/ws/{self.symbol.lower()}@kline_1m",
+            f"wss://fstream2.binance.com/ws/{self.symbol.lower()}@kline_1m"
+        ]
+        
+        # 현재 시도할 엔드포인트 선택 (라운드 로빈)
+        endpoint_index = self.reconnect_attempts % len(endpoints)
+        url = endpoints[endpoint_index]
+        
+        self.logger.info(f"Attempting connection to: {url}")
         
         try:
-            # 연결 타임아웃과 ping 설정
+            # 더욱 보수적인 연결 설정
             async with websockets.connect(
                 url,
-                ping_interval=20,  # 20초마다 ping 전송
-                ping_timeout=10,   # ping 응답 대기 시간
-                close_timeout=10,  # 연결 종료 대기 시간
-                max_size=2**20,    # 최대 메시지 크기 (1MB)
-                compression=None   # 압축 비활성화로 성능 향상
+                ping_interval=10,   # 10초마다 ping (더 자주)
+                ping_timeout=5,     # ping 응답 대기 시간 더 단축
+                close_timeout=3,    # 연결 종료 대기 시간 더 단축
+                max_size=2**20,     # 최대 메시지 크기 (1MB)
+                compression=None,   # 압축 비활성화
+                # 추가 헤더로 연결 안정성 향상
+                extra_headers={
+                    'User-Agent': 'TradingBot/1.0',
+                    'Connection': 'keep-alive',
+                    'Cache-Control': 'no-cache'
+                }
             ) as ws:
-                self.logger.info("WebSocket connection established successfully")
+                self.logger.info(f"WebSocket connection established successfully to {url}")
                 self.reconnect_attempts = 0  # 성공적으로 연결되면 재연결 카운터 리셋
+                
+                # 연결 상태 모니터링 변수
+                last_message_time = time.time()
+                heartbeat_interval = 15  # 15초마다 하트비트 체크 (더 자주)
+                ping_count = 0
+                max_consecutive_pings = 3  # 연속 ping 실패 허용 횟수
                 
                 while True:
                     try:
-                        # 메시지 수신 타임아웃 설정 (30초)
-                        msg = await asyncio.wait_for(ws.recv(), timeout=30.0)
+                        # 메시지 수신 타임아웃 설정 (15초로 더 단축)
+                        msg = await asyncio.wait_for(ws.recv(), timeout=15.0)
                         msg = json.loads(msg)
+                        last_message_time = time.time()
+                        ping_count = 0  # 메시지 수신 시 ping 카운터 리셋
                         
                         if msg.get('e') == 'kline':
                             kline = msg['k']
@@ -164,19 +210,48 @@ class BinanceClient:
                             await callback(data)
                             
                     except asyncio.TimeoutError:
-                        self.logger.warning("No message received for 30 seconds, checking connection...")
-                        # ping을 보내서 연결 상태 확인
-                        try:
-                            await ws.ping()
-                        except Exception:
-                            self.logger.warning("Ping failed, connection may be lost")
-                            raise
+                        # 타임아웃 발생 시 연결 상태 확인
+                        current_time = time.time()
+                        time_since_last_msg = current_time - last_message_time
+                        
+                        if time_since_last_msg > heartbeat_interval:
+                            self.logger.warning(f"No message received for {time_since_last_msg:.1f} seconds, checking connection...")
+                            
+                            # 연결 상태 확인을 위한 ping
+                            try:
+                                pong_waiter = await ws.ping()
+                                await asyncio.wait_for(pong_waiter, timeout=3.0)  # 더 짧은 타임아웃
+                                self.logger.info("Connection ping successful")
+                                last_message_time = current_time
+                                ping_count = 0
+                            except (asyncio.TimeoutError, websockets.exceptions.ConnectionClosed):
+                                ping_count += 1
+                                self.logger.warning(f"Ping failed ({ping_count}/{max_consecutive_pings})")
+                                
+                                if ping_count >= max_consecutive_pings:
+                                    self.logger.error("Max consecutive ping failures reached, reconnecting...")
+                                    raise websockets.exceptions.ConnectionClosed(1011, "Multiple ping timeouts")
+                                
+                                # 짧은 대기 후 재시도
+                                await asyncio.sleep(1)
+                                continue
+                            except Exception as ping_error:
+                                self.logger.warning(f"Ping error: {ping_error}, reconnecting...")
+                                raise
+                        else:
+                            # 아직 하트비트 간격 내라면 계속 대기
+                            continue
+                            
                     except websockets.exceptions.ConnectionClosed as e:
                         self.logger.warning(f"WebSocket connection closed: {e}")
                         raise
                     except json.JSONDecodeError as e:
                         self.logger.warning(f"Failed to parse JSON message: {e}")
                         continue  # JSON 파싱 에러는 무시하고 계속
+                    except Exception as e:
+                        self.logger.error(f"Unexpected error in message handling: {e}")
+                        # 예상치 못한 에러는 재연결 시도
+                        raise
                         
         except websockets.exceptions.InvalidURI as e:
             self.logger.error(f"Invalid WebSocket URI: {e}")
