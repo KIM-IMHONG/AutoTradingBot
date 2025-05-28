@@ -11,6 +11,47 @@ import numpy as np
 from binance.client import Client
 import time
 
+class RateLimiter:
+    """API 요청 제한 관리 클래스"""
+    def __init__(self):
+        self.request_times = []
+        self.weight_usage = {}
+        self.max_requests_per_minute = 1000  # 안전 마진을 둔 제한
+        self.max_weight_per_minute = 1200
+        self.order_count = 0
+        self.max_orders_per_minute = 100  # 주문 제한
+        
+    async def wait_if_needed(self, weight=1, is_order=False):
+        """필요시 대기"""
+        current_time = time.time()
+        
+        # 1분 이전 요청 제거
+        self.request_times = [t for t in self.request_times if current_time - t < 60]
+        
+        # 요청 수 제한 확인
+        if len(self.request_times) >= self.max_requests_per_minute:
+            wait_time = 60 - (current_time - self.request_times[0])
+            if wait_time > 0:
+                await asyncio.sleep(wait_time)
+                
+        # Weight 제한 확인
+        total_weight = sum(self.weight_usage.get(t, 0) for t in self.request_times)
+        if total_weight + weight > self.max_weight_per_minute:
+            wait_time = 60 - (current_time - self.request_times[0])
+            if wait_time > 0:
+                await asyncio.sleep(wait_time)
+                
+        # 주문 제한 확인
+        if is_order and self.order_count >= self.max_orders_per_minute:
+            await asyncio.sleep(60)
+            self.order_count = 0
+            
+        # 요청 기록
+        self.request_times.append(current_time)
+        self.weight_usage[current_time] = weight
+        if is_order:
+            self.order_count += 1
+
 class BinanceClient:
     def __init__(self, symbol=None):
         """Initialize Binance client"""
@@ -24,10 +65,66 @@ class BinanceClient:
         self.volatility_window = 24  # 24시간 데이터로 변동성 계산
         self.leverage_update_interval = 3600  # 1시간마다 레버리지 업데이트
         self.last_leverage_update = 0
+        
+        # Rate Limiter 추가
+        self.rate_limiter = RateLimiter()
+        
+        # 캐시 시스템 추가
+        self.cache = {}
+        self.cache_ttl = {}
+        self.default_cache_duration = 30  # 30초 캐시
+        
+        # 배치 요청 시스템
+        self.batch_requests = []
+        self.batch_interval = 5  # 5초마다 배치 처리
+        self.last_batch_time = time.time()
+        
+        # WebSocket 안전장치 추가
+        self.is_connected = False
+        self.last_price = None
+        self.last_data_time = None
+        self.connection_lost_time = None
+        self.data_buffer = []  # 재연결 시 데이터 검증용
+        self.max_buffer_size = 100
+        self.price_validation_threshold = 0.05  # 5% 이상 가격 변동 시 검증
+        self.reconnection_callback = None  # 재연결 시 호출할 콜백
+        
+        # API 요청 최적화
+        self.position_cache_duration = 10  # 포지션 정보 10초 캐시
+        self.account_cache_duration = 30   # 계정 정보 30초 캐시
+        self.last_position_request = 0
+        self.last_account_request = 0
+
+    def get_cache(self, key):
+        """캐시에서 데이터 가져오기"""
+        if key in self.cache and key in self.cache_ttl:
+            if time.time() < self.cache_ttl[key]:
+                return self.cache[key]
+            else:
+                # 만료된 캐시 삭제
+                del self.cache[key]
+                del self.cache_ttl[key]
+        return None
+
+    def set_cache(self, key, value, duration=None):
+        """캐시에 데이터 저장"""
+        if duration is None:
+            duration = self.default_cache_duration
+        self.cache[key] = value
+        self.cache_ttl[key] = time.time() + duration
 
     async def calculate_optimal_leverage(self):
         """Calculate optimal leverage based on market volatility"""
         try:
+            # 캐시 확인
+            cache_key = f"optimal_leverage_{self.symbol}"
+            cached_result = self.get_cache(cache_key)
+            if cached_result:
+                return cached_result
+                
+            # Rate limiting 적용
+            await self.rate_limiter.wait_if_needed(weight=5)
+            
             # 과거 데이터 가져오기 (24시간)
             klines = await self.get_historical_klines(interval='1h', limit=self.volatility_window)
             
@@ -58,6 +155,9 @@ class BinanceClient:
             # 레버리지 범위 제한
             optimal_leverage = max(1, min(optimal_leverage, MAX_LEVERAGE))
             
+            # 결과 캐시 (1시간)
+            self.set_cache(cache_key, optimal_leverage, 3600)
+            
             self.logger.info(f"Calculated optimal leverage: {optimal_leverage}x (Volatility: {volatility:.4f}, ATR: {atr:.2f})")
             return optimal_leverage
             
@@ -68,6 +168,7 @@ class BinanceClient:
     async def initialize(self):
         """Initialize Binance client and websocket manager"""
         try:
+            await self.rate_limiter.wait_if_needed(weight=1)
             self.client = await AsyncClient.create(BINANCE_API_KEY, BINANCE_API_SECRET)
             self.bm = BinanceSocketManager(self.client)
             
@@ -92,8 +193,18 @@ class BinanceClient:
         return None
 
     async def get_historical_klines(self, interval='1m', limit=100):
-        """Get historical klines/candlestick data"""
+        """Get historical klines/candlestick data with caching"""
         try:
+            # 캐시 확인
+            cache_key = f"klines_{self.symbol}_{interval}_{limit}"
+            cached_result = self.get_cache(cache_key)
+            if cached_result is not None:
+                return cached_result
+                
+            # Rate limiting 적용 (weight: 1-5 depending on limit)
+            weight = 1 if limit <= 100 else 2 if limit <= 500 else 5
+            await self.rate_limiter.wait_if_needed(weight=weight)
+            
             klines = await self.client.futures_klines(
                 symbol=self.symbol,
                 interval=interval,
@@ -108,6 +219,11 @@ class BinanceClient:
             df.set_index('timestamp', inplace=True)
             for col in ['open', 'high', 'low', 'close', 'volume']:
                 df[col] = df[col].astype(float)
+                
+            # 결과 캐시 (간격에 따라 다른 캐시 시간)
+            cache_duration = 60 if interval == '1m' else 300 if interval == '5m' else 900
+            self.set_cache(cache_key, df, cache_duration)
+            
             return df
         except BinanceAPIException as e:
             self.logger.error(f"Failed to get historical klines: {e}")
@@ -115,10 +231,15 @@ class BinanceClient:
 
     async def stream_klines(self, callback):
         """Stream real-time klines data with robust reconnection logic"""
+        self.reconnection_callback = callback  # 콜백 저장
+        
         while True:
             try:
                 await self._stream_klines_with_reconnect(callback)
             except Exception as e:
+                self.is_connected = False
+                self.connection_lost_time = time.time()
+                
                 self.reconnect_attempts += 1
                 if self.reconnect_attempts >= self.max_reconnect_attempts:
                     self.logger.error(f"Max reconnection attempts ({self.max_reconnect_attempts}) reached. Stopping.")
@@ -140,6 +261,9 @@ class BinanceClient:
                 
                 self.logger.warning(f"WebSocket connection failed (attempt {self.reconnect_attempts}/{self.max_reconnect_attempts}). Reconnecting in {delay:.1f} seconds...")
                 self.logger.info(f"Error details: {e}")
+                
+                # 연결 끊김 중 포지션 상태 확인
+                await self._check_position_during_disconnect()
                 
                 await asyncio.sleep(delay)
                 
@@ -207,6 +331,27 @@ class BinanceClient:
                                 'close': float(kline['c']),
                                 'volume': float(kline['v'])
                             }
+                            
+                            # 연결 상태 업데이트
+                            if not self.is_connected:
+                                self.is_connected = True
+                                self.connection_lost_time = None
+                                self.logger.info("WebSocket connection restored successfully")
+                                
+                                # 재연결 후 데이터 검증
+                                if not await self._validate_reconnection_data(data):
+                                    self.logger.error("Data validation failed after reconnection, skipping this data point")
+                                    continue
+                            
+                            # 데이터 버퍼 관리
+                            self.data_buffer.append(data)
+                            if len(self.data_buffer) > self.max_buffer_size:
+                                self.data_buffer.pop(0)
+                            
+                            # 가격 정보 업데이트
+                            self.last_price = data['close']
+                            self.last_data_time = time.time()
+                            
                             await callback(data)
                             
                     except asyncio.TimeoutError:
@@ -263,198 +408,260 @@ class BinanceClient:
             self.logger.error(f"Unexpected error in kline stream: {e}")
             raise
 
-    async def place_order(self, side, quantity, order_type='MARKET', price=None, reduce_only=False):
-        """Place a futures order with optional reduceOnly flag"""
+    async def _check_position_during_disconnect(self):
+        """연결 끊김 중 포지션 상태 확인 및 보호"""
         try:
-            # 수량 정밀도 조정 (BTC의 경우 3자리까지)
-            quantity = round(quantity, 3)
-            
-            # 최소 주문 수량 확인 (BTC의 경우 0.001)
-            if quantity < 0.001:
-                quantity = 0.001
+            if self.connection_lost_time:
+                disconnect_duration = time.time() - self.connection_lost_time
                 
-            params = {
+                if disconnect_duration > 30:  # 30초 이상 끊김
+                    self.logger.warning(f"Connection lost for {disconnect_duration:.1f} seconds. Checking position safety...")
+                    
+                    # 현재 포지션 확인
+                    position = await self.get_position()
+                    if position and abs(float(position.get('positionAmt', 0))) > 0:
+                        unrealized_pnl = float(position.get('unRealizedPnl', 0))
+                        percentage = float(position.get('percentage', 0))
+                        
+                        # 큰 손실 발생 시 경고
+                        if percentage < -3:  # 3% 이상 손실
+                            self.logger.error(f"ALERT: Large loss during disconnect! PnL: {percentage:.2f}%")
+                            # 필요시 여기서 긴급 청산 로직 추가 가능
+                        
+                        self.logger.info(f"Position status during disconnect - PnL: {percentage:.2f}%, Amount: {position.get('positionAmt')}")
+                
+        except Exception as e:
+            self.logger.error(f"Error checking position during disconnect: {e}")
+
+    async def _validate_reconnection_data(self, new_data):
+        """재연결 후 데이터 검증"""
+        try:
+            if not self.last_price or not new_data:
+                return True
+            
+            new_price = new_data.get('close', 0)
+            if not new_price:
+                return True
+            
+            # 가격 변동률 검증
+            price_change = abs(new_price - self.last_price) / self.last_price
+            
+            if price_change > self.price_validation_threshold:
+                self.logger.warning(f"Large price change detected after reconnection: {price_change:.2%}")
+                
+                # REST API로 현재 가격 재확인
+                try:
+                    ticker = await self.client.futures_symbol_ticker(symbol=self.symbol)
+                    api_price = float(ticker['price'])
+                    
+                    # API 가격과 WebSocket 가격 비교
+                    api_ws_diff = abs(api_price - new_price) / api_price
+                    
+                    if api_ws_diff > 0.001:  # 0.1% 이상 차이
+                        self.logger.error(f"Price mismatch! WebSocket: {new_price}, API: {api_price}")
+                        return False
+                    else:
+                        self.logger.info("Price validated successfully with REST API")
+                        
+                except Exception as api_error:
+                    self.logger.error(f"Failed to validate price with API: {api_error}")
+                    return False
+            
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Error validating reconnection data: {e}")
+            return True  # 검증 실패 시 데이터 허용 (보수적 접근)
+
+    async def place_order(self, side, quantity, order_type='MARKET', price=None, reduce_only=False):
+        """Place an order with rate limiting"""
+        try:
+            # Rate limiting 적용 (주문은 높은 weight)
+            await self.rate_limiter.wait_if_needed(weight=10, is_order=True)
+            
+            order_params = {
                 'symbol': self.symbol,
                 'side': side,
                 'type': order_type,
-                'quantity': quantity
+                'quantity': quantity,
+                'reduceOnly': reduce_only
             }
-            if price and order_type == 'LIMIT':
-                params['price'] = price
-                params['timeInForce'] = 'GTC'
-            if reduce_only:
-                params['reduceOnly'] = True
-            order = await self.client.futures_create_order(**params)
-            self.logger.info(f"Order placed successfully: {order}")
-            return order
+            
+            if order_type == 'LIMIT' and price:
+                order_params['price'] = price
+                order_params['timeInForce'] = 'GTC'
+            
+            result = await self.client.futures_create_order(**order_params)
+            self.logger.info(f"Order placed successfully: {result}")
+            return result
         except BinanceAPIException as e:
             self.logger.error(f"Failed to place order: {e}")
             raise
 
     async def get_position(self):
-        """Get current position information"""
+        """Get current position with caching"""
         try:
+            # 캐시 확인
+            current_time = time.time()
+            if current_time - self.last_position_request < self.position_cache_duration:
+                cache_key = f"position_{self.symbol}"
+                cached_result = self.get_cache(cache_key)
+                if cached_result is not None:
+                    return cached_result
+            
+            # Rate limiting 적용
+            await self.rate_limiter.wait_if_needed(weight=5)
+            
             positions = await self.client.futures_position_information(symbol=self.symbol)
-            return positions[0] if positions else None
+            position = positions[0] if positions else None
+            
+            # 캐시 저장
+            cache_key = f"position_{self.symbol}"
+            self.set_cache(cache_key, position, self.position_cache_duration)
+            self.last_position_request = current_time
+            
+            return position
         except BinanceAPIException as e:
             self.logger.error(f"Failed to get position: {e}")
             raise
 
     async def close(self):
-        """Close the Binance client connection"""
+        """Close the client connection"""
         if self.client:
             await self.client.close_connection()
-            self.logger.info("Binance client connection closed")
 
     async def set_leverage(self, leverage):
-        """Set leverage for the symbol - only when no position exists"""
+        """Set leverage for the symbol with rate limiting"""
         try:
-            # Check if there are open positions
-            position = await self.get_position()
-            if position and abs(float(position.get('positionAmt', 0))) > 0:
-                current_leverage = int(position.get('leverage', 1))
-                self.logger.info(f"Position exists with {current_leverage}x leverage. Maintaining current position and leverage.")
-                return True
+            # 캐시 확인 (현재 레버리지)
+            cache_key = f"leverage_{self.symbol}"
+            cached_leverage = self.get_cache(cache_key)
+            if cached_leverage == leverage:
+                return  # 이미 같은 레버리지면 요청하지 않음
+                
+            # Rate limiting 적용
+            await self.rate_limiter.wait_if_needed(weight=1)
             
-            # Try to set margin type to ISOLATED first (only when no position)
-            try:
-                await self.client.futures_change_margin_type(symbol=self.symbol, marginType='ISOLATED')
-                self.logger.info(f"Changed margin type to ISOLATED for {self.symbol}")
-            except Exception as margin_error:
-                # If already in ISOLATED mode, this will fail - that's okay
-                if "No need to change margin type" in str(margin_error) or "-4046" in str(margin_error):
-                    self.logger.info(f"Margin type already set to ISOLATED for {self.symbol}")
-                else:
-                    self.logger.warning(f"Could not change margin type: {margin_error}")
+            await self.client.futures_change_leverage(symbol=self.symbol, leverage=leverage)
             
-            # Now try to set leverage (only when no position)
-            result = await self.client.futures_change_leverage(symbol=self.symbol, leverage=leverage)
+            # 캐시 업데이트
+            self.set_cache(cache_key, leverage, 3600)  # 1시간 캐시
+            
             self.logger.info(f"Leverage set to {leverage}x for {self.symbol}")
-            return True
-            
-        except Exception as e:
-            error_msg = str(e)
-            if "Leverage reduction is not supported in Isolated Margin Mode" in error_msg:
-                self.logger.info(f"Cannot change leverage in Isolated Margin Mode with open positions. Using current leverage.")
-                return True  # Continue trading with current leverage
-            elif "No need to change leverage" in error_msg or "-4028" in error_msg:
-                self.logger.info(f"Leverage already set to {leverage}x for {self.symbol}")
-                return True
+        except BinanceAPIException as e:
+            if "No need to change margin type" in str(e) or "leverage not modified" in str(e):
+                self.logger.info(f"Leverage already set to {leverage}x")
+                # 캐시 업데이트
+                cache_key = f"leverage_{self.symbol}"
+                self.set_cache(cache_key, leverage, 3600)
             else:
                 self.logger.error(f"Failed to set leverage: {e}")
-                return False
+                raise
 
-    async def analyze_existing_position(self, position, current_price, technical_data=None):
-        """Analyze existing position to determine if it should be maintained"""
+    async def get_account_info(self):
+        """Get account information with caching"""
         try:
-            if not position or abs(float(position.get('positionAmt', 0))) == 0:
-                return {'action': 'none', 'reason': 'No position exists'}
+            # 캐시 확인
+            current_time = time.time()
+            if current_time - self.last_account_request < self.account_cache_duration:
+                cache_key = "account_info"
+                cached_result = self.get_cache(cache_key)
+                if cached_result is not None:
+                    return cached_result
             
-            entry_price = float(position.get('entryPrice', 0))
-            position_amt = float(position.get('positionAmt', 0))
-            unrealized_pnl = float(position.get('unRealizedPnl', 0))
-            percentage = float(position.get('percentage', 0))
+            # Rate limiting 적용
+            await self.rate_limiter.wait_if_needed(weight=5)
             
-            # 포지션 방향 확인
-            is_long = position_amt > 0
-            side = 'LONG' if is_long else 'SHORT'
+            account_info = await self.client.futures_account()
             
-            # 현재 수익률 계산
-            if is_long:
-                pnl_percentage = (current_price - entry_price) / entry_price * 100
-            else:
-                pnl_percentage = (entry_price - current_price) / entry_price * 100
+            # 캐시 저장
+            cache_key = "account_info"
+            self.set_cache(cache_key, account_info, self.account_cache_duration)
+            self.last_account_request = current_time
             
-            self.logger.info(f"Analyzing existing {side} position: Entry={entry_price}, Current={current_price}, PnL={pnl_percentage:.2f}%")
-            
-            # 포지션 유지 조건 분석
-            analysis_result = {
-                'action': 'maintain',
-                'reason': 'Position analysis in progress',
-                'entry_price': entry_price,
-                'current_price': current_price,
-                'pnl_percentage': pnl_percentage,
-                'side': side,
-                'leverage': int(position.get('leverage', 1))
-            }
-            
-            # 1. 큰 손실 상황 (-5% 이상)
-            if pnl_percentage < -5:
-                analysis_result.update({
-                    'action': 'close',
-                    'reason': f'Large loss detected: {pnl_percentage:.2f}%'
-                })
-                return analysis_result
-            
-            # 2. 큰 수익 상황 (+10% 이상) - 일부 익절 고려
-            if pnl_percentage > 10:
-                analysis_result.update({
-                    'action': 'partial_close',
-                    'reason': f'Large profit detected: {pnl_percentage:.2f}%, consider partial profit taking'
-                })
-                return analysis_result
-            
-            # 3. 기술적 분석이 있는 경우 추가 검증
-            if technical_data:
-                # RSI 과매수/과매도 확인
-                rsi = technical_data.get('rsi', 50)
-                if is_long and rsi > 80:
-                    analysis_result.update({
-                        'action': 'close',
-                        'reason': f'LONG position with RSI overbought: {rsi:.1f}'
-                    })
-                    return analysis_result
-                elif not is_long and rsi < 20:
-                    analysis_result.update({
-                        'action': 'close',
-                        'reason': f'SHORT position with RSI oversold: {rsi:.1f}'
-                    })
-                    return analysis_result
-                
-                # 추세 전환 확인
-                ema_short = technical_data.get('ema_short', current_price)
-                ema_long = technical_data.get('ema_long', current_price)
-                
-                if is_long and ema_short < ema_long:
-                    analysis_result.update({
-                        'action': 'close',
-                        'reason': 'LONG position but trend turning bearish (EMA crossover)'
-                    })
-                    return analysis_result
-                elif not is_long and ema_short > ema_long:
-                    analysis_result.update({
-                        'action': 'close',
-                        'reason': 'SHORT position but trend turning bullish (EMA crossover)'
-                    })
-                    return analysis_result
-            
-            # 4. 기본적으로 유지 (손실이 크지 않고 기술적으로 문제없음)
-            if -2 <= pnl_percentage <= 8:
-                analysis_result.update({
-                    'action': 'maintain',
-                    'reason': f'Position within acceptable range: {pnl_percentage:.2f}%'
-                })
-            
-            return analysis_result
-            
-        except Exception as e:
-            self.logger.error(f"Error analyzing existing position: {e}")
-            return {
-                'action': 'maintain',
-                'reason': f'Analysis error, maintaining position: {e}',
-                'error': True
-            }
+            return account_info
+        except BinanceAPIException as e:
+            self.logger.error(f"Failed to get account info: {e}")
+            raise
 
-    async def get_position_with_analysis(self, current_price, technical_data=None):
-        """Get position information with analysis"""
+    async def get_symbol_info(self):
+        """Get symbol information with caching"""
         try:
-            position = await self.get_position()
-            if not position:
-                return None, None
+            # 캐시 확인 (심볼 정보는 자주 변하지 않으므로 긴 캐시)
+            cache_key = f"symbol_info_{self.symbol}"
+            cached_result = self.get_cache(cache_key)
+            if cached_result is not None:
+                return cached_result
             
-            analysis = await self.analyze_existing_position(position, current_price, technical_data)
-            return position, analysis
+            # Rate limiting 적용
+            await self.rate_limiter.wait_if_needed(weight=1)
             
-        except Exception as e:
-            self.logger.error(f"Error getting position with analysis: {e}")
-            return None, None 
+            exchange_info = await self.client.futures_exchange_info()
+            symbol_info = None
+            
+            for symbol in exchange_info['symbols']:
+                if symbol['symbol'] == self.symbol:
+                    symbol_info = symbol
+                    break
+            
+            # 캐시 저장 (4시간)
+            if symbol_info:
+                self.set_cache(cache_key, symbol_info, 14400)
+            
+            return symbol_info
+        except BinanceAPIException as e:
+            self.logger.error(f"Failed to get symbol info: {e}")
+            raise
+
+    async def get_current_price(self):
+        """Get current price with caching"""
+        try:
+            # 캐시 확인 (가격은 짧은 캐시)
+            cache_key = f"price_{self.symbol}"
+            cached_result = self.get_cache(cache_key)
+            if cached_result is not None:
+                return cached_result
+            
+            # Rate limiting 적용
+            await self.rate_limiter.wait_if_needed(weight=1)
+            
+            ticker = await self.client.futures_symbol_ticker(symbol=self.symbol)
+            price = float(ticker['price'])
+            
+            # 캐시 저장 (5초)
+            self.set_cache(cache_key, price, 5)
+            
+            return price
+        except BinanceAPIException as e:
+            self.logger.error(f"Failed to get current price: {e}")
+            raise
+
+    async def batch_process_requests(self):
+        """배치로 요청 처리 (향후 확장용)"""
+        if not self.batch_requests:
+            return
+            
+        current_time = time.time()
+        if current_time - self.last_batch_time >= self.batch_interval:
+            # 배치 요청 처리 로직
+            self.logger.info(f"Processing {len(self.batch_requests)} batch requests")
+            
+            # 실제 배치 처리는 향후 구현
+            self.batch_requests.clear()
+            self.last_batch_time = current_time
+
+    def get_rate_limit_status(self):
+        """현재 rate limit 상태 반환"""
+        current_time = time.time()
+        recent_requests = [t for t in self.rate_limiter.request_times if current_time - t < 60]
+        total_weight = sum(self.rate_limiter.weight_usage.get(t, 0) for t in recent_requests)
+        
+        return {
+            'requests_per_minute': len(recent_requests),
+            'max_requests_per_minute': self.rate_limiter.max_requests_per_minute,
+            'weight_per_minute': total_weight,
+            'max_weight_per_minute': self.rate_limiter.max_weight_per_minute,
+            'orders_per_minute': self.rate_limiter.order_count,
+            'max_orders_per_minute': self.rate_limiter.max_orders_per_minute,
+            'cache_size': len(self.cache)
+        } 
