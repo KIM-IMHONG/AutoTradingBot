@@ -960,5 +960,5 @@ class TechnicalAnalyzer:
             }
             
         except Exception as e:
-            self.logger.error(f"Error in analyze: {e}")
+            logger.error(f"Error in analyze: {e}")
             return {'signal': 0, 'score': 0, 'trend': 'neutral'} 
