@@ -763,7 +763,8 @@ class TechnicalAnalyzer:
                 'score': score,
                 'trend': trend,
                 'volume_ratio': volume_ratio,
-                'volatility': atr_ratio
+                'volatility': atr_ratio,
+                'adx': adx  # ADX 값 추가
             }
             
         except Exception as e:
