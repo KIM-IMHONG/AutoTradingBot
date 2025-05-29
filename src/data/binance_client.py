@@ -114,7 +114,7 @@ class BinanceClient:
         self.cache_ttl[key] = time.time() + duration
 
     async def calculate_optimal_leverage(self):
-        """Calculate optimal leverage based on market volatility"""
+        """Calculate optimal leverage based on market volatility and price levels"""
         try:
             # 캐시 확인
             cache_key = f"optimal_leverage_{self.symbol}"
@@ -143,14 +143,35 @@ class BinanceClient:
             # 현재 가격
             current_price = float(klines['close'].iloc[-1])
             
+            # 횡보장 감지
+            adx = klines['adx'].iloc[-1] if 'adx' in klines.columns else 25
+            is_sideways = adx < 20
+            
+            # 고점/저점 계산 (최근 24시간)
+            recent_high = klines['high'].max()
+            recent_low = klines['low'].min()
+            price_range = recent_high - recent_low
+            
+            # 현재 가격의 위치 계산 (0~1 사이 값)
+            price_position = (current_price - recent_low) / price_range if price_range > 0 else 0.5
+            
             # 변동성 기반 레버리지 계산
-            # 변동성이 높을수록 레버리지 감소
-            volatility_factor = 1 / (1 + volatility * 100)  # 변동성이 1% 증가할 때마다 레버리지 감소
-            atr_factor = 1 / (1 + (atr / current_price) * 100)  # ATR이 가격의 1% 증가할 때마다 레버리지 감소
+            volatility_factor = 1 / (1 + volatility * 100)
+            atr_factor = 1 / (1 + (atr / current_price) * 100)
+            
+            # 횡보장에서의 레버리지 조정
+            if is_sideways:
+                # 고점/저점 근처에서 레버리지 증가
+                if price_position < 0.2 or price_position > 0.8:  # 고점/저점 20% 구간
+                    position_factor = 1.5  # 레버리지 50% 증가
+                else:
+                    position_factor = 1.0
+            else:
+                position_factor = 1.0
             
             # 최종 레버리지 계산
-            base_leverage = MAX_LEVERAGE // 2  # 기본값은 최대 레버리지의 절반
-            optimal_leverage = int(base_leverage * volatility_factor * atr_factor)
+            base_leverage = MAX_LEVERAGE // 2
+            optimal_leverage = int(base_leverage * volatility_factor * atr_factor * position_factor)
             
             # 레버리지 범위 제한
             optimal_leverage = max(1, min(optimal_leverage, MAX_LEVERAGE))
@@ -158,7 +179,11 @@ class BinanceClient:
             # 결과 캐시 (1시간)
             self.set_cache(cache_key, optimal_leverage, 3600)
             
-            self.logger.info(f"Calculated optimal leverage: {optimal_leverage}x (Volatility: {volatility:.4f}, ATR: {atr:.2f})")
+            self.logger.info(
+                f"Calculated optimal leverage: {optimal_leverage}x "
+                f"(Volatility: {volatility:.4f}, ATR: {atr:.2f}, "
+                f"Sideways: {is_sideways}, Price Position: {price_position:.2f})"
+            )
             return optimal_leverage
             
         except Exception as e:
@@ -228,6 +253,10 @@ class BinanceClient:
         except BinanceAPIException as e:
             self.logger.error(f"Failed to get historical klines: {e}")
             raise
+
+    async def get_klines(self, interval='1m', limit=100):
+        """Wrapper method for get_historical_klines to maintain compatibility"""
+        return await self.get_historical_klines(interval=interval, limit=limit)
 
     async def stream_klines(self, callback):
         """Stream real-time klines data with robust reconnection logic"""

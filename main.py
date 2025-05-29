@@ -19,6 +19,7 @@ from src.data.news_collector import NewsCollector
 from src.analysis.technical import TechnicalAnalyzer
 from src.analysis.signal_generator import SignalGenerator
 from src.utils.telegram_bot import TelegramBot
+from src.utils.auto_recovery import auto_recovery, with_auto_recovery
 import time
 
 # Configure logging
@@ -37,6 +38,7 @@ class TradingBot:
         self.technical_analyzer = TechnicalAnalyzer(self.symbol)
         self.signal_generator = SignalGenerator(self.symbol)
         self.telegram = TelegramBot()
+        self.auto_recovery = auto_recovery  # 자동 복구 시스템 추가
         self.current_position = None
         self.daily_pnl = 0
         self.klines_data = pd.DataFrame()
@@ -74,6 +76,109 @@ class TradingBot:
         # Initialize logging
         self.logger = logging.getLogger(__name__)
         self.logger.setLevel(logging.INFO)
+
+    @with_auto_recovery
+    async def get_current_price(self):
+        """Get current price with auto-recovery"""
+        try:
+            return await self.binance.get_current_price()
+        except Exception as e:
+            self.logger.error(f"Error getting current price: {e}")
+            raise
+    
+    @with_auto_recovery
+    async def collect_market_data(self):
+        """Collect market data with auto-recovery"""
+        try:
+            # 시장 데이터 수집
+            klines = await self.binance.get_klines(limit=500)
+            if klines is None or klines.empty:
+                raise ValueError("No market data received")
+            
+            self.klines_data = klines
+            return klines
+        except Exception as e:
+            self.logger.error(f"Error collecting market data: {e}")
+            raise
+
+    @with_auto_recovery
+    async def execute_trade_with_recovery(self, signal, score, adx):
+        """Execute trade with auto-recovery protection"""
+        try:
+            return await self.execute_trade(signal, score, adx)
+        except Exception as e:
+            self.logger.error(f"Error executing trade: {e}")
+            raise
+
+    async def run_with_auto_recovery(self):
+        """메인 루프를 자동 복구와 함께 실행"""
+        try:
+            while True:
+                try:
+                    # 복구 시스템 상태 체크
+                    recovery_status = self.auto_recovery.get_recovery_status()
+                    if recovery_status['recovery_attempts'] > 0:
+                        self.logger.info(f"Recovery status: {recovery_status}")
+                    
+                    # 메인 트레이딩 로직 실행
+                    await self.run_single_iteration()
+                    
+                    # 정상 대기
+                    await asyncio.sleep(60)
+                    
+                except Exception as e:
+                    # 자동 복구 시스템 활성화
+                    context = {'function': 'main_trading_loop'}
+                    recovery_success = await self.auto_recovery.handle_error(e, context)
+                    
+                    if not recovery_success:
+                        self.logger.error("Auto-recovery failed. Stopping bot.")
+                        break
+                    
+                    # 복구 성공시 짧은 대기 후 재시작
+                    await asyncio.sleep(30)
+                    
+        except KeyboardInterrupt:
+            self.logger.info("Bot stopped by user")
+        except Exception as e:
+            self.logger.error(f"Critical error in main loop: {e}")
+            await self.auto_recovery.notify_admin(f"Critical bot failure: {e}")
+
+    async def run_single_iteration(self):
+        """단일 반복 실행 (복구 가능한 단위)"""
+        try:
+            # 현재 가격 조회
+            current_price = await self.get_current_price()
+            self.logger.info(f"Current price: {current_price}")
+            
+            # 시장 데이터 수집
+            klines = await self.collect_market_data()
+            
+            # 기술적 분석
+            analysis = self.technical_analyzer.analyze(klines)
+            self.logger.info(f"Technical Analysis - Signal: {analysis['signal']}, Score: {analysis['score']:.2f}, Trend: {analysis['trend']}")
+            
+            # 뉴스 감정 분석
+            sentiment_score = await self.news_collector.get_sentiment_score()
+            self.logger.info(f"Sentiment Score: {sentiment_score:.2f}")
+            
+            # 신호 생성
+            signal, score, adx = self.signal_generator.generate_signal(
+                analysis, sentiment_score, current_price
+            )
+            self.logger.info(f"Generated Signal: {signal}, Score: {score:.2f}, ADX: {adx:.2f}")
+            
+            # 거래 실행
+            if signal != 0:
+                await self.execute_trade_with_recovery(signal, score, adx)
+            
+            # 포지션 모니터링
+            if self.current_position:
+                await self.monitor_position()
+                
+        except Exception as e:
+            self.logger.error(f"Error in single iteration: {e}")
+            raise
 
     async def initialize(self):
         """Initialize all components"""
@@ -1244,30 +1349,65 @@ class TradingBot:
             raise
 
 async def main():
-    """Main function with API monitoring"""
-    bot = None
+    """Main function with auto-recovery system"""
+    # Load environment variables
+    load_dotenv()
+    
+    # 자동 복구 시스템 설정 확인
+    logger.info("🔧 Auto-recovery system configuration:")
+    logger.info(f"   OpenAI API Key: {'✅ Set' if os.getenv('OPENAI_API_KEY') else '❌ Not set'}")
+    logger.info(f"   Auto-fix enabled: {os.getenv('AUTO_FIX_ENABLED', 'False')}")
+    logger.info(f"   Recovery webhook: {'✅ Set' if os.getenv('RECOVERY_WEBHOOK_URL') else '❌ Not set'}")
+    
+    # 환경변수 확인
+    required_vars = ['BINANCE_API_KEY', 'BINANCE_API_SECRET', 'TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID']
+    missing_vars = [var for var in required_vars if not os.getenv(var)]
+    
+    if missing_vars:
+        logger.error(f"❌ Missing required environment variables: {missing_vars}")
+        return
+    else:
+        logger.info("✅ All required environment variables are already set")
+    
+    # Create bot instance
+    bot = TradingBot()
+    
     try:
-        # 봇 초기화
-        bot = TradingBot()
-        await bot.initialize()
+        logger.info("Starting trading bot...")
         
-        # API 모니터링 태스크 시작
-        monitor_task = asyncio.create_task(bot.monitor_api_usage())
+        # Initialize with auto-recovery
+        try:
+            await bot.initialize()
+        except Exception as e:
+            logger.error(f"Initialization failed: {e}")
+            # 초기화 실패시에도 자동 복구 시도
+            context = {'function': 'initialization'}
+            recovery_success = await bot.auto_recovery.handle_error(e, context)
+            
+            if recovery_success:
+                logger.info("Recovery successful, retrying initialization...")
+                await bot.initialize()
+            else:
+                logger.error("Failed to recover from initialization error")
+                return
         
-        # 메인 봇 실행
-        await bot.run()
-        
+        # 자동 복구가 활성화된 메인 루프 실행
+        if os.getenv('AUTO_RECOVERY_ENABLED', 'True').lower() == 'true':
+            logger.info("🛡️ Starting bot with auto-recovery system")
+            await bot.run_with_auto_recovery()
+        else:
+            logger.info("⚠️ Starting bot without auto-recovery (legacy mode)")
+            await bot.run()
+            
     except KeyboardInterrupt:
-        logging.info("Bot stopped by user")
+        logger.info("🛑 Bot stopped by user")
     except Exception as e:
-        logging.error(f"Fatal error: {e}")
-        if bot and hasattr(bot, 'telegram_bot'):
-            await bot.telegram_bot.send_message(f"❌ Fatal Error: {e}")
-    finally:
-        if bot:
-            await bot.cleanup()
-        if 'monitor_task' in locals():
-            monitor_task.cancel()
+        logger.error(f"💥 Critical error in main: {e}")
+        # 마지막 수단으로 관리자에게 알림
+        try:
+            await bot.auto_recovery.notify_admin(f"Critical main function error: {e}")
+        except:
+            pass
 
 if __name__ == "__main__":
     asyncio.run(main()) 

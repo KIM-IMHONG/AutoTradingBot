@@ -11,7 +11,8 @@ except ImportError:
 from config.settings import (
     RSI_PERIOD, RSI_OVERBOUGHT, RSI_OVERSOLD,
     MACD_FAST, MACD_SLOW, MACD_SIGNAL,
-    EMA_SHORT, EMA_MEDIUM, EMA_LONG
+    EMA_SHORT, EMA_MEDIUM, EMA_LONG,
+    STOCH_K, STOCH_D, STOCH_SLOW
 )
 import logging
 
@@ -59,6 +60,64 @@ class TechnicalAnalyzer:
             df['ema_medium'] = self.ema_medium.ema_indicator()
             df['ema_long'] = self.ema_long.ema_indicator()
 
+            # ADX (Average Directional Index)
+            high = df['high']
+            low = df['low']
+            close = df['close']
+            
+            # True Range
+            tr1 = high - low
+            tr2 = abs(high - close.shift(1))
+            tr3 = abs(low - close.shift(1))
+            tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+            
+            # Directional Movement
+            up_move = high - high.shift(1)
+            down_move = low.shift(1) - low
+            
+            plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0)
+            minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0)
+            
+            # Smoothed TR and DM
+            period = 14
+            smoothed_tr = tr.rolling(window=period).sum()
+            smoothed_plus_dm = pd.Series(plus_dm).rolling(window=period).sum()
+            smoothed_minus_dm = pd.Series(minus_dm).rolling(window=period).sum()
+            
+            # Plus and Minus DI
+            plus_di = 100 * (smoothed_plus_dm / smoothed_tr)
+            minus_di = 100 * (smoothed_minus_dm / smoothed_tr)
+            
+            # ADX
+            dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
+            df['adx'] = dx.rolling(window=period).mean()
+            
+            # Stochastic
+            stoch = StochasticOscillator(
+                high=df['high'],
+                low=df['low'],
+                close=df['close'],
+                window=STOCH_K,
+                smooth_window=STOCH_D
+            )
+            df['stoch_k'] = stoch.stoch()
+            df['stoch_d'] = stoch.stoch_signal()
+            
+            # Bollinger Bands
+            bb = BollingerBands(close=df['close'], window=20, window_dev=2)
+            df['bb_high'] = bb.bollinger_hband()
+            df['bb_low'] = bb.bollinger_lband()
+            df['bb_mid'] = bb.bollinger_mavg()
+            
+            # ATR
+            atr = AverageTrueRange(
+                high=df['high'],
+                low=df['low'],
+                close=df['close'],
+                window=14
+            )
+            df['atr'] = atr.average_true_range()
+            
             # Advanced indicators
             df = self.calculate_advanced_indicators(df)
 
@@ -84,6 +143,21 @@ class TechnicalAnalyzer:
             
         except Exception as e:
             logger.error(f"Error in calculate_indicators: {e}")
+            # 에러 발생 시 기본값으로 채우기
+            df['rsi'] = 50
+            df['macd'] = 0
+            df['macd_signal'] = 0
+            df['macd_diff'] = 0
+            df['ema_short'] = df['close']
+            df['ema_medium'] = df['close']
+            df['ema_long'] = df['close']
+            df['stoch_k'] = 50
+            df['stoch_d'] = 50
+            df['bb_high'] = df['close']
+            df['bb_low'] = df['close']
+            df['bb_mid'] = df['close']
+            df['atr'] = 0
+            df['adx'] = 25  # ADX 기본값 추가
             return df
 
     def calculate_supertrend(self, df, period=10, multiplier=3):
@@ -700,6 +774,9 @@ class TechnicalAnalyzer:
             atr = current['atr']
             atr_ratio = atr / current['close'] if current['close'] > 0 else 0
             
+            # ADX 확인 (추세 강도) - 먼저 정의
+            adx = current.get('adx', 25)
+            
             # Generate signal based on indicators (추세 추종 강화)
             signal_count = 0
             total_score = 0
@@ -776,8 +853,7 @@ class TechnicalAnalyzer:
                 signal_count += 0.8  # 추가 매수 신호
                 total_score += 0.3
             
-            # ADX 확인 (추세 강도)
-            adx = current.get('adx', 25)
+            # ADX 기반 신호 조정
             if adx < 20:  # 약한 추세 - 신호 무효화
                 signal_count = 0
                 total_score = 0
@@ -871,7 +947,7 @@ class TechnicalAnalyzer:
             logger.info(f"   Price Changes: 1m({price_change_1m:.2f}%) 5m({price_change_5m:.2f}%)")
             
             # 시장 상황별 신호 생성 로직
-            signal = 0
+            final_signal = 0
             
             if market_condition == "crash":  # 폭락장 - 역추세 매수 기회
                 logger.info(f"   🔴 CRASH Market Strategy")
@@ -880,7 +956,7 @@ class TechnicalAnalyzer:
                     current['close'] < current['bb_low'] and 
                     volume_ratio > 1.5 and
                     total_score >= 0.3):
-                    signal = 1
+                    final_signal = 1
                     logger.info(f"   ✅ CRASH REVERSAL BUY! RSI:{current['rsi']:.1f} BB_Low:{current['bb_low']:.1f}")
                 else:
                     logger.info(f"   ❌ Crash conditions not met: RSI({current['rsi']:.1f}) BB({current['close']:.1f}>{current['bb_low']:.1f})")
@@ -892,7 +968,7 @@ class TechnicalAnalyzer:
                     current['close'] > current['bb_high'] and 
                     volume_ratio > 1.5 and
                     total_score >= 0.3):
-                    signal = -1
+                    final_signal = -1
                     logger.info(f"   ✅ PUMP REVERSAL SELL! RSI:{current['rsi']:.1f} BB_High:{current['bb_high']:.1f}")
                 else:
                     logger.info(f"   ❌ Pump conditions not met: RSI({current['rsi']:.1f}) BB({current['close']:.1f}<{current['bb_high']:.1f})")
@@ -903,12 +979,12 @@ class TechnicalAnalyzer:
                 if (current['close'] < current['bb_low'] and 
                     current['stoch_k'] < 20 and 
                     total_score >= 0.2):
-                    signal = 1
+                    final_signal = 1
                     logger.info(f"   ✅ SIDEWAYS BUY at BB_Low! Stoch:{current['stoch_k']:.1f}")
                 elif (current['close'] > current['bb_high'] and 
                       current['stoch_k'] > 80 and 
                       total_score >= 0.2):
-                    signal = -1
+                    final_signal = -1
                     logger.info(f"   ✅ SIDEWAYS SELL at BB_High! Stoch:{current['stoch_k']:.1f}")
                 else:
                     logger.info(f"   ❌ Sideways conditions not met: BB position, Stoch:{current['stoch_k']:.1f}")
@@ -920,7 +996,7 @@ class TechnicalAnalyzer:
                     if (signal_count <= -1.0 and 
                         total_score >= 0.4 and
                         current['rsi'] > 30):  # 너무 과매도되지 않은 상태에서
-                        signal = -1
+                        final_signal = -1
                         logger.info(f"   ✅ BEARISH TREND SELL! Count:{signal_count:.2f}")
                     else:
                         logger.info(f"   ❌ Bearish trend conditions not met: Count({signal_count:.2f}) RSI({current['rsi']:.1f})")
@@ -929,28 +1005,21 @@ class TechnicalAnalyzer:
                     if (signal_count >= 1.0 and 
                         total_score >= 0.4 and
                         current['rsi'] < 70):  # 너무 과매수되지 않은 상태에서
-                        signal = 1
+                        final_signal = 1
                         logger.info(f"   ✅ BULLISH TREND BUY! Count:{signal_count:.2f}")
                     else:
                         logger.info(f"   ❌ Bullish trend conditions not met: Count({signal_count:.2f}) RSI({current['rsi']:.1f})")
                         
             else:  # 일반 시장 - 기존 로직
                 logger.info(f"   📊 NORMAL Market Strategy")
-                if signal_count >= 1.5 and total_score >= 0.5:
-                    signal = 1
-                    logger.info(f"   ✅ NORMAL BUY Signal!")
-                elif signal_count <= -1.5 and total_score >= 0.5:
-                    signal = -1
-                    logger.info(f"   ✅ NORMAL SELL Signal!")
-                else:
-                    logger.info(f"   ❌ Normal conditions not met: Count({signal_count:.2f}) Score({total_score:.3f})")
+                final_signal = signal  # 위에서 계산한 신호 사용
             
             # 최종 신호 확인
-            if signal != 0:
-                logger.info(f"   🎯 FINAL SIGNAL: {signal} in {market_condition} market")
+            if final_signal != 0:
+                logger.info(f"   🎯 FINAL SIGNAL: {final_signal} in {market_condition} market")
             
             return {
-                'signal': signal,
+                'signal': final_signal,
                 'score': score,
                 'trend': trend,
                 'volume_ratio': volume_ratio,
